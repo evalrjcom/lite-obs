@@ -1,5 +1,7 @@
 # LiteCast Studio v1.0.0 — User & Developer Guide
 
+[![CI](https://github.com/evalrjcom/lite-obs/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/lite-obs/actions/workflows/ci.yml)
+
 `litecast_v1.0.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
@@ -145,6 +147,14 @@ color / image ──────────────────────
 DISPLAY=:0 cargo test --release   # 8 unit tests: blending, clipping, sanitising, args, redaction, helpers
 ```
 (One test builds a default profile, which queries monitor geometry, so it needs an X display; Xvfb works.)
+
+### CI & releases
+`.github/workflows/ci.yml` runs on every push and pull request:
+- **Linux** (Ubuntu 24.04): `cargo fmt --check`, `clippy -D warnings`, unit tests under Xvfb, a release build, and a **headless smoke test**. The smoke test records 4 s of a display + media + colour scene with `--record` and fails if the file has fewer than 60 frames.
+- **Windows** (latest): clippy and release build.
+- Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
+- **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
+  `git tag v1.0.1 && git push origin v1.0.1`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
 
 ### Security model
 - Every child process is spawned with an argv list; no shell is ever invoked.

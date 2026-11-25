@@ -1,0 +1,182 @@
+# LiteCast Studio CI — lint, test, headless smoke test, Linux + Windows builds.
+# Pushing a tag vX.Y.Z (must match Cargo.toml version) publishes a GitHub release.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: Linux (lint, test, smoke, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build & runtime dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends \
+            cmake ninja-build pkg-config \
+            libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev \
+            libxrender-dev libxfixes-dev libpango1.0-dev libcairo2-dev \
+            libgl1-mesa-dev libglu1-mesa-dev xvfb xauth ffmpeg
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Read version from Cargo.toml
+        id: ver
+        run: |
+          v=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          [ -n "$v" ] || { echo "::error::no version in Cargo.toml"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$v" ]]; then
+            echo "::error::tag ${GITHUB_REF#refs/tags/} does not match Cargo.toml version $v"; exit 1
+          fi
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Unit tests (Xvfb)
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" cargo test --release --locked
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Headless smoke test (--record)
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/smoke"; mkdir -p "$T/rec"
+          ffmpeg -hide_banner -loglevel error -y -f lavfi -i testsrc2=size=320x180:rate=30 -t 3 "$T/clip.mp4"
+          cat > "$T/profile.json" <<JSON
+          {"format":1,
+           "settings":{"canvas_w":640,"canvas_h":360,"fps":30,"audio_api":"none",
+                       "rec_dir":"$T/rec","rec_format":"mkv"},
+           "scenes":[{"name":"Smoke","sources":[
+             {"id":1,"name":"Desk","kind":{"type":"display","target":"","x":0,"y":0,"w":640,"h":360,"cursor":false},
+              "visible":true,"x":0,"y":0,"w":640,"h":360,"opacity":255},
+             {"id":2,"name":"Clip","kind":{"type":"media","path":"$T/clip.mp4","looping":true},
+              "visible":true,"x":20,"y":20,"w":320,"h":180,"opacity":255},
+             {"id":3,"name":"Tint","kind":{"type":"color","r":0,"g":0,"b":255},
+              "visible":true,"x":300,"y":150,"w":200,"h":150,"opacity":128}]}],
+           "current":0}
+          JSON
+          timeout 90 xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./target/release/litecast --profile "$T/profile.json" --record 4
+          f=$(ls "$T"/rec/*.mkv | head -1)
+          n=$(ffprobe -v error -count_frames -select_streams v:0 \
+                -show_entries stream=nb_read_frames -of csv=p=0 "$f")
+          echo "recorded $f with $n frames"
+          [ "$n" -ge 60 ] || { echo "::error::smoke recording too short ($n frames)"; exit 1; }
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          v="${{ steps.ver.outputs.version }}"
+          d="litecast_v${v}-linux-x86_64"
+          mkdir -p "dist/$d"
+          cp target/release/litecast "dist/$d/litecast_v${v}"
+          cp README.md "dist/$d/README_litecast_v${v}.md"
+          tar -C dist -czf "dist/$d.tar.gz" "$d"
+          (cd dist && sha256sum "$d.tar.gz" > "$d.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: litecast_v${{ steps.ver.outputs.version }}-linux-x86_64
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  windows:
+    name: Windows (lint, build)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    needs: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: clippy
+        run: cargo clippy --release --all-targets --locked -- -D warnings
+
+      - name: Build release
+        run: cargo build --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $v = "${{ needs.linux.outputs.version }}"
+          $d = "litecast_v$v-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path "dist/$d" | Out-Null
+          Copy-Item target/release/litecast.exe "dist/$d/litecast_v$v.exe"
+          Copy-Item README.md "dist/$d/README_litecast_v$v.md"
+          Compress-Archive -Path "dist/$d" -DestinationPath "dist/$d.zip" -Force
+          $h = (Get-FileHash "dist/$d.zip" -Algorithm SHA256).Hash.ToLower()
+          "$h  $d.zip" | Out-File -Encoding ascii "dist/$d.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: litecast_v${{ needs.linux.outputs.version }}-windows-x86_64
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VER: ${{ needs.linux.outputs.version }}
+        run: |
+          set -euo pipefail
+          ls -la dist
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "LiteCast Studio v$VER" \
+            --notes "Automated build of LiteCast Studio v$VER (litecast_v$VER). Requires ffmpeg >= 4.4 at runtime. See README for details." \
+            --verify-tag

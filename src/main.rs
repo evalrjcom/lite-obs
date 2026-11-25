@@ -56,8 +56,8 @@ use std::{
     process::{Child, ChildStderr, ChildStdin, Command, Stdio},
     rc::Rc,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
         Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -88,7 +88,12 @@ const ENCODERS: &[&str] = &[
     "h264_videotoolbox",
 ];
 const X264_PRESETS: &[&str] = &[
-    "ultrafast", "superfast", "veryfast", "faster", "fast", "medium",
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
 ];
 const REC_FORMATS: &[&str] = &["mkv", "mp4", "mov", "flv", "ts"];
 const AUDIO_APIS: &[&str] = &["none", "pulse", "alsa", "dshow", "avfoundation"];
@@ -250,11 +255,31 @@ impl Default for Settings {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SourceKind {
-    Display { target: String, x: i32, y: i32, w: u32, h: u32, cursor: bool },
-    Webcam { device: String, size: String, fps: u32 },
-    Media { path: String, looping: bool },
-    Image { path: String },
-    Color { r: u8, g: u8, b: u8 },
+    Display {
+        target: String,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        cursor: bool,
+    },
+    Webcam {
+        device: String,
+        size: String,
+        fps: u32,
+    },
+    Media {
+        path: String,
+        looping: bool,
+    },
+    Image {
+        path: String,
+    },
+    Color {
+        r: u8,
+        g: u8,
+        b: u8,
+    },
 }
 impl SourceKind {
     fn label(&self) -> &'static str {
@@ -308,7 +333,12 @@ impl Default for Profile {
     fn default() -> Self {
         let s = Settings::default();
         let (sx, sy, sw, sh) = primary_screen_px();
-        let (fx, fy, fw, fh) = fit_rect(sw.max(2) as u32, sh.max(2) as u32, s.canvas_w as i32, s.canvas_h as i32);
+        let (fx, fy, fw, fh) = fit_rect(
+            sw.max(2) as u32,
+            sh.max(2) as u32,
+            s.canvas_w as i32,
+            s.canvas_h as i32,
+        );
         let disp = Source {
             id: 1,
             name: "Display Capture".into(),
@@ -330,7 +360,10 @@ impl Default for Profile {
         Self {
             format: 1,
             settings: s,
-            scenes: vec![Scene { name: "Scene 1".into(), sources: vec![disp] }],
+            scenes: vec![Scene {
+                name: "Scene 1".into(),
+                sources: vec![disp],
+            }],
             current: 0,
         }
     }
@@ -342,7 +375,10 @@ fn default_display_target() -> String {
     } else if cfg!(target_os = "macos") {
         "1".into()
     } else {
-        std::env::var("DISPLAY").ok().filter(|d| !d.is_empty()).unwrap_or_else(|| ":0.0".into())
+        std::env::var("DISPLAY")
+            .ok()
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| ":0.0".into())
     }
 }
 fn default_webcam_target() -> String {
@@ -409,10 +445,19 @@ fn sanitize(p: &mut Profile) {
     }
     p.scenes.truncate(MAX_SCENES);
     if p.scenes.is_empty() {
-        p.scenes.push(Scene { name: "Scene 1".into(), sources: vec![] });
+        p.scenes.push(Scene {
+            name: "Scene 1".into(),
+            sources: vec![],
+        });
     }
     let mut seen = HashSet::new();
-    let mut next_id = p.scenes.iter().flat_map(|s| s.sources.iter().map(|x| x.id)).max().unwrap_or(0) + 1;
+    let mut next_id = p
+        .scenes
+        .iter()
+        .flat_map(|s| s.sources.iter().map(|x| x.id))
+        .max()
+        .unwrap_or(0)
+        + 1;
     for sc in &mut p.scenes {
         sc.name = truncate_chars(&sc.name, 64);
         sc.sources.truncate(MAX_SOURCES);
@@ -428,7 +473,9 @@ fn sanitize(p: &mut Profile) {
             src.x = src.x.clamp(-(MAX_W as i32), MAX_W as i32);
             src.y = src.y.clamp(-(MAX_H as i32), MAX_H as i32);
             match &mut src.kind {
-                SourceKind::Display { w, h, x, y, target, .. } => {
+                SourceKind::Display {
+                    w, h, x, y, target, ..
+                } => {
                     *w = (*w).clamp(1, 16384);
                     *h = (*h).clamp(1, 16384);
                     *x = (*x).clamp(-32768, 32767);
@@ -467,9 +514,10 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 
 fn config_dir() -> PathBuf {
     if cfg!(windows)
-        && let Some(a) = std::env::var_os("APPDATA") {
-            return PathBuf::from(a).join("litecast");
-        }
+        && let Some(a) = std::env::var_os("APPDATA")
+    {
+        return PathBuf::from(a).join("litecast");
+    }
     if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
         return PathBuf::from(x).join("litecast");
     }
@@ -482,7 +530,8 @@ fn load_profile(path: &Path) -> Result<Profile, String> {
         return Err("profile too large (>4 MiB)".into());
     }
     let data = fs::read(path).map_err(|e| e.to_string())?;
-    let mut p: Profile = serde_json::from_slice(&data).map_err(|e| format!("invalid profile: {e}"))?;
+    let mut p: Profile =
+        serde_json::from_slice(&data).map_err(|e| format!("invalid profile: {e}"))?;
     sanitize(&mut p);
     Ok(p)
 }
@@ -493,7 +542,10 @@ fn save_profile(path: &Path, p: &Profile) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        let _ = fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
     }
     #[cfg(not(unix))]
     {
@@ -509,7 +561,9 @@ fn save_profile(path: &Path, p: &Profile) -> Result<(), String> {
             use std::os::unix::fs::OpenOptionsExt;
             o.mode(0o600);
         }
-        let mut f = o.open(&tmp).map_err(|e| format!("{}: {e}", tmp.display()))?;
+        let mut f = o
+            .open(&tmp)
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
         f.write_all(&data).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
     }
@@ -569,7 +623,11 @@ fn run_tool(
 ) -> Result<(Vec<u8>, String, Option<i32>), String> {
     let mut cmd = ffmpeg_cmd(prog);
     cmd.args(args)
-        .stdin(if stdin_data.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdin(if stdin_data.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("cannot run {prog}: {e}"))?;
@@ -625,28 +683,52 @@ fn run_tool(
 fn detect_ffmpeg(prog: &str) -> FfInfo {
     let mut fi = FfInfo::default();
     let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    if let Ok((o, _, Some(0))) = run_tool(prog, &a(&["-hide_banner", "-version"]), None, 64 * 1024, Duration::from_secs(5), None) {
+    if let Ok((o, _, Some(0))) = run_tool(
+        prog,
+        &a(&["-hide_banner", "-version"]),
+        None,
+        64 * 1024,
+        Duration::from_secs(5),
+        None,
+    ) {
         let s = String::from_utf8_lossy(&o);
         let first = s.lines().next().unwrap_or("").to_string();
         fi.version = first.clone();
-        let ver = first.split_whitespace().nth(2).unwrap_or("").trim_start_matches('n');
+        let ver = first
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("")
+            .trim_start_matches('n');
         let mut it = ver.split(|c: char| !c.is_ascii_digit());
         let maj = it.next().and_then(|v| v.parse().ok());
         let min = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
         // Git builds ("N-12345-g...") are always newer than any release.
-        (fi.major, fi.minor) = match maj { Some(m) => (m, min), None => (99, 0) };
+        (fi.major, fi.minor) = match maj {
+            Some(m) => (m, min),
+            None => (99, 0),
+        };
         fi.ok = true;
     }
     if fi.ok
-        && let Ok((o, _, _)) = run_tool(prog, &a(&["-hide_banner", "-encoders"]), None, 512 * 1024, Duration::from_secs(5), None) {
-            for line in String::from_utf8_lossy(&o).lines() {
-                let mut t = line.split_whitespace();
-                if let (Some(flags), Some(name)) = (t.next(), t.next())
-                    && flags.len() == 6 && (flags.starts_with('V') || flags.starts_with('A')) {
-                        fi.encoders.insert(name.to_string());
-                    }
+        && let Ok((o, _, _)) = run_tool(
+            prog,
+            &a(&["-hide_banner", "-encoders"]),
+            None,
+            512 * 1024,
+            Duration::from_secs(5),
+            None,
+        )
+    {
+        for line in String::from_utf8_lossy(&o).lines() {
+            let mut t = line.split_whitespace();
+            if let (Some(flags), Some(name)) = (t.next(), t.next())
+                && flags.len() == 6
+                && (flags.starts_with('V') || flags.starts_with('A'))
+            {
+                fi.encoders.insert(name.to_string());
             }
         }
+    }
     fi
 }
 
@@ -654,34 +736,82 @@ fn detect_ffmpeg(prog: &str) -> FfInfo {
 type DevList = Vec<(String, String)>;
 
 fn parse_dshow(ff: &str) -> (DevList, DevList) {
-    let args: Vec<String> = ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
-        .iter().map(|s| s.to_string()).collect();
+    let args: Vec<String> = [
+        "-hide_banner",
+        "-list_devices",
+        "true",
+        "-f",
+        "dshow",
+        "-i",
+        "dummy",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let (mut v, mut a) = (vec![], vec![]);
     if let Ok((_, err, _)) = run_tool(ff, &args, None, 1024, Duration::from_secs(6), None) {
         let mut section = 0; // 1 video, 2 audio
         for line in err.lines() {
-            if line.contains("DirectShow video devices") { section = 1; continue; }
-            if line.contains("DirectShow audio devices") { section = 2; continue; }
-            if line.contains("Alternative name") { continue; }
-            let (Some(s), Some(e)) = (line.find('"'), line.rfind('"')) else { continue };
-            if e <= s + 1 { continue; }
+            if line.contains("DirectShow video devices") {
+                section = 1;
+                continue;
+            }
+            if line.contains("DirectShow audio devices") {
+                section = 2;
+                continue;
+            }
+            if line.contains("Alternative name") {
+                continue;
+            }
+            let (Some(s), Some(e)) = (line.find('"'), line.rfind('"')) else {
+                continue;
+            };
+            if e <= s + 1 {
+                continue;
+            }
             let name = line[s + 1..e].to_string();
-            let kind = if line.ends_with("(video)") { 1 } else if line.ends_with("(audio)") { 2 } else { section };
-            match kind { 1 => v.push((name.clone(), name)), 2 => a.push((name.clone(), name)), _ => {} }
+            let kind = if line.ends_with("(video)") {
+                1
+            } else if line.ends_with("(audio)") {
+                2
+            } else {
+                section
+            };
+            match kind {
+                1 => v.push((name.clone(), name)),
+                2 => a.push((name.clone(), name)),
+                _ => {}
+            }
         }
     }
     (v, a)
 }
 
 fn parse_avfoundation(ff: &str) -> (DevList, DevList) {
-    let args: Vec<String> = ["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]
-        .iter().map(|s| s.to_string()).collect();
+    let args: Vec<String> = [
+        "-hide_banner",
+        "-f",
+        "avfoundation",
+        "-list_devices",
+        "true",
+        "-i",
+        "",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     let (mut v, mut a) = (vec![], vec![]);
     if let Ok((_, err, _)) = run_tool(ff, &args, None, 1024, Duration::from_secs(6), None) {
         let mut section = 0;
         for line in err.lines() {
-            if line.contains("video devices:") { section = 1; continue; }
-            if line.contains("audio devices:") { section = 2; continue; }
+            if line.contains("video devices:") {
+                section = 1;
+                continue;
+            }
+            if line.contains("audio devices:") {
+                section = 2;
+                continue;
+            }
             // "...] [0] FaceTime HD Camera"
             if let Some(p) = line.rfind("] [") {
                 let rest = &line[p + 3..];
@@ -689,7 +819,11 @@ fn parse_avfoundation(ff: &str) -> (DevList, DevList) {
                     let idx = rest[..q].to_string();
                     let label = format!("{} — {}", idx, rest[q + 1..].trim());
                     if idx.chars().all(|c| c.is_ascii_digit()) {
-                        match section { 1 => v.push((idx, label)), 2 => a.push((idx, label)), _ => {} }
+                        match section {
+                            1 => v.push((idx, label)),
+                            2 => a.push((idx, label)),
+                            _ => {}
+                        }
                     }
                 }
             }
@@ -708,7 +842,9 @@ fn detect_video_devices(ff: &str) -> DevList {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("video") && n[5..].chars().all(|c| c.is_ascii_digit()))
+                    .filter(|n| {
+                        n.starts_with("video") && n[5..].chars().all(|c| c.is_ascii_digit())
+                    })
                     .map(|n| format!("/dev/{n}"))
                     .collect()
             })
@@ -724,9 +860,19 @@ fn detect_audio_devices(api: &str, ff: &str) -> DevList {
         "pulse" => {
             let mut v: DevList = vec![
                 ("default".into(), "default (default microphone)".into()),
-                ("@DEFAULT_MONITOR@".into(), "@DEFAULT_MONITOR@ (desktop audio)".into()),
+                (
+                    "@DEFAULT_MONITOR@".into(),
+                    "@DEFAULT_MONITOR@ (desktop audio)".into(),
+                ),
             ];
-            if let Ok((o, _, _)) = run_tool("pactl", &s(&["list", "short", "sources"]), None, 256 * 1024, Duration::from_secs(3), None) {
+            if let Ok((o, _, _)) = run_tool(
+                "pactl",
+                &s(&["list", "short", "sources"]),
+                None,
+                256 * 1024,
+                Duration::from_secs(3),
+                None,
+            ) {
                 for l in String::from_utf8_lossy(&o).lines() {
                     if let Some(n) = l.split('\t').nth(1) {
                         v.push((n.to_string(), n.to_string()));
@@ -737,9 +883,20 @@ fn detect_audio_devices(api: &str, ff: &str) -> DevList {
         }
         "alsa" => {
             let mut v: DevList = vec![("default".into(), "default".into())];
-            if let Ok((o, _, _)) = run_tool("arecord", &s(&["-L"]), None, 256 * 1024, Duration::from_secs(3), None) {
+            if let Ok((o, _, _)) = run_tool(
+                "arecord",
+                &s(&["-L"]),
+                None,
+                256 * 1024,
+                Duration::from_secs(3),
+                None,
+            ) {
                 for l in String::from_utf8_lossy(&o).lines() {
-                    if !l.is_empty() && !l.starts_with(char::is_whitespace) && l != "default" && l != "null" {
+                    if !l.is_empty()
+                        && !l.starts_with(char::is_whitespace)
+                        && l != "default"
+                        && l != "null"
+                    {
                         v.push((l.to_string(), l.to_string()));
                     }
                 }
@@ -754,7 +911,12 @@ fn detect_audio_devices(api: &str, ff: &str) -> DevList {
 
 /// Bounded line reader for child stderr. Drains continuously so a chatty
 /// ffmpeg can never fill the pipe and deadlock.
-fn spawn_stderr_drain(err: ChildStderr, tag: String, log: Logger, last: Arc<Mutex<String>>) -> Option<JoinHandle<()>> {
+fn spawn_stderr_drain(
+    err: ChildStderr,
+    tag: String,
+    log: Logger,
+    last: Arc<Mutex<String>>,
+) -> Option<JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("stderr-{tag}"))
         .spawn(move || {
@@ -767,7 +929,9 @@ fn spawn_stderr_drain(err: ChildStderr, tag: String, log: Logger, last: Arc<Mute
                     Ok(_) => {
                         let s = String::from_utf8_lossy(&buf);
                         let s = s.trim();
-                        if s.is_empty() { continue; }
+                        if s.is_empty() {
+                            continue;
+                        }
                         *lock(&last) = truncate_chars(s, 300);
                         log.log(format!("[{tag}] {s}"));
                     }
@@ -783,7 +947,11 @@ fn read_full<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<bool> {
     while off < buf.len() {
         match r.read(&mut buf[off..]) {
             Ok(0) => {
-                return if off == 0 { Ok(false) } else { Err(std::io::ErrorKind::UnexpectedEof.into()) };
+                return if off == 0 {
+                    Ok(false)
+                } else {
+                    Err(std::io::ErrorKind::UnexpectedEof.into())
+                };
             }
             Ok(n) => off += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -808,38 +976,106 @@ fn publish(slot: &FrameSlot, buf: Vec<u8>) -> Option<Vec<u8>> {
 /// BGRA at exactly the source's transform size.
 fn capture_args(kind: &SourceKind, w: u32, h: u32, fps: u32) -> Result<Vec<String>, String> {
     let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-nostats"]
-        .iter().map(|s| s.to_string()).collect();
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let mut pre_vf = String::new();
     let p = |a: &mut Vec<String>, v: &[&str]| a.extend(v.iter().map(|s| s.to_string()));
     match kind {
-        SourceKind::Display { target, x, y, w: rw, h: rh, cursor } => {
+        SourceKind::Display {
+            target,
+            x,
+            y,
+            w: rw,
+            h: rh,
+            cursor,
+        } => {
             let cur = if *cursor { "1" } else { "0" };
             let fps_s = fps.to_string();
             let size = format!("{rw}x{rh}");
             if cfg!(windows) {
-                p(&mut a, &["-f", "gdigrab", "-framerate", &fps_s, "-draw_mouse", cur]);
+                p(
+                    &mut a,
+                    &["-f", "gdigrab", "-framerate", &fps_s, "-draw_mouse", cur],
+                );
                 if target.starts_with("title=") {
                     p(&mut a, &["-i", target]);
                 } else {
                     let (xs, ys) = (x.to_string(), y.to_string());
-                    p(&mut a, &["-offset_x", &xs, "-offset_y", &ys, "-video_size", &size, "-i", "desktop"]);
+                    p(
+                        &mut a,
+                        &[
+                            "-offset_x",
+                            &xs,
+                            "-offset_y",
+                            &ys,
+                            "-video_size",
+                            &size,
+                            "-i",
+                            "desktop",
+                        ],
+                    );
                 }
             } else if cfg!(target_os = "macos") {
-                let t = if target.trim().is_empty() { "1".to_string() } else { target.clone() };
+                let t = if target.trim().is_empty() {
+                    "1".to_string()
+                } else {
+                    target.clone()
+                };
                 let inp = format!("{t}:none");
-                p(&mut a, &["-f", "avfoundation", "-capture_cursor", cur, "-framerate", &fps_s, "-i", &inp]);
+                p(
+                    &mut a,
+                    &[
+                        "-f",
+                        "avfoundation",
+                        "-capture_cursor",
+                        cur,
+                        "-framerate",
+                        &fps_s,
+                        "-i",
+                        &inp,
+                    ],
+                );
                 pre_vf = format!("crop={rw}:{rh}:{x}:{y},");
             } else {
-                let disp = if target.trim().is_empty() { default_display_target() } else { target.clone() };
+                let disp = if target.trim().is_empty() {
+                    default_display_target()
+                } else {
+                    target.clone()
+                };
                 let inp = format!("{disp}+{x},{y}");
-                p(&mut a, &["-f", "x11grab", "-framerate", &fps_s, "-draw_mouse", cur, "-video_size", &size, "-i", &inp]);
+                p(
+                    &mut a,
+                    &[
+                        "-f",
+                        "x11grab",
+                        "-framerate",
+                        &fps_s,
+                        "-draw_mouse",
+                        cur,
+                        "-video_size",
+                        &size,
+                        "-i",
+                        &inp,
+                    ],
+                );
             }
         }
-        SourceKind::Webcam { device, size, fps: wf } => {
+        SourceKind::Webcam {
+            device,
+            size,
+            fps: wf,
+        } => {
             if device.trim().is_empty() {
                 return Err("no webcam device set".into());
             }
-            let api = if cfg!(windows) { "dshow" } else if cfg!(target_os = "macos") { "avfoundation" } else { "v4l2" };
+            let api = if cfg!(windows) {
+                "dshow"
+            } else if cfg!(target_os = "macos") {
+                "avfoundation"
+            } else {
+                "v4l2"
+            };
             p(&mut a, &["-f", api]);
             if cfg!(windows) {
                 p(&mut a, &["-rtbufsize", "64M"]);
@@ -873,7 +1109,12 @@ fn capture_args(kind: &SourceKind, w: u32, h: u32, fps: u32) -> Result<Vec<Strin
         _ => return Err("not a process source".into()),
     }
     let vf = format!("{pre_vf}scale={w}:{h}:flags=bilinear,format={PIX}");
-    p(&mut a, &["-an", "-sn", "-dn", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", PIX, "pipe:1"]);
+    p(
+        &mut a,
+        &[
+            "-an", "-sn", "-dn", "-vf", &vf, "-f", "rawvideo", "-pix_fmt", PIX, "pipe:1",
+        ],
+    );
     Ok(a)
 }
 
@@ -921,18 +1162,42 @@ impl SourceRuntime {
             }
             SourceKind::Image { path } => {
                 let args: Vec<String> = vec![
-                    "-hide_banner".into(), "-loglevel".into(), "error".into(), "-nostdin".into(),
-                    "-i".into(), file_arg(path), "-frames:v".into(), "1".into(),
-                    "-vf".into(), format!("scale={w}:{h}:flags=lanczos,format={PIX}"),
-                    "-f".into(), "rawvideo".into(), "-pix_fmt".into(), PIX.into(), "pipe:1".into(),
+                    "-hide_banner".into(),
+                    "-loglevel".into(),
+                    "error".into(),
+                    "-nostdin".into(),
+                    "-i".into(),
+                    file_arg(path),
+                    "-frames:v".into(),
+                    "1".into(),
+                    "-vf".into(),
+                    format!("scale={w}:{h}:flags=lanczos,format={PIX}"),
+                    "-f".into(),
+                    "rawvideo".into(),
+                    "-pix_fmt".into(),
+                    PIX.into(),
+                    "pipe:1".into(),
                 ];
-                let (slot, opaque, stop, status, log, ff) =
-                    (rt.slot.clone(), rt.opaque.clone(), rt.stop.clone(), rt.status.clone(), ctx.log.clone(), ctx.ffmpeg.clone());
+                let (slot, opaque, stop, status, log, ff) = (
+                    rt.slot.clone(),
+                    rt.opaque.clone(),
+                    rt.stop.clone(),
+                    rt.status.clone(),
+                    ctx.log.clone(),
+                    ctx.ffmpeg.clone(),
+                );
                 let need = w as usize * h as usize * 4;
                 rt.thread = thread::Builder::new()
                     .name(format!("img-{name}"))
                     .spawn(move || {
-                        match run_tool(&ff, &args, None, need as u64, Duration::from_secs(20), Some(&stop)) {
+                        match run_tool(
+                            &ff,
+                            &args,
+                            None,
+                            need as u64,
+                            Duration::from_secs(20),
+                            Some(&stop),
+                        ) {
                             Ok((buf, _, _)) if buf.len() == need => {
                                 opaque.store(all_opaque(&buf), Relaxed);
                                 *lock(&slot) = Some(Arc::new(buf));
@@ -974,7 +1239,10 @@ impl SourceRuntime {
                     status: rt.status.clone(),
                     noloop_media,
                 };
-                rt.thread = thread::Builder::new().name(format!("cap-{name}")).spawn(move || capture_loop(cfg)).ok();
+                rt.thread = thread::Builder::new()
+                    .name(format!("cap-{name}"))
+                    .spawn(move || capture_loop(cfg))
+                    .ok();
             }
         }
         rt
@@ -1012,12 +1280,18 @@ fn capture_loop(c: CapCfg) {
     let mut spare: Option<Vec<u8>> = None;
     while !c.stop.load(Relaxed) {
         let mut cmd = ffmpeg_cmd(&c.ffmpeg);
-        cmd.args(&c.args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.args(&c.args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(ch) => ch,
             Err(e) => {
                 *lock(&c.status) = format!("error: cannot start ffmpeg: {e}");
-                c.log.log(format!("[{}] cannot start ffmpeg ({}): {e}", c.name, c.ffmpeg));
+                c.log.log(format!(
+                    "[{}] cannot start ffmpeg ({}): {e}",
+                    c.name, c.ffmpeg
+                ));
                 sleep_interruptible(backoff, &c.stop);
                 backoff = (backoff * 2).min(Duration::from_secs(10));
                 continue;
@@ -1025,18 +1299,25 @@ fn capture_loop(c: CapCfg) {
         };
         let stdout = child.stdout.take();
         let last_err = Arc::new(Mutex::new(String::new()));
-        let drain = child.stderr.take().and_then(|e| spawn_stderr_drain(e, c.name.clone(), c.log.clone(), last_err.clone()));
+        let drain = child
+            .stderr
+            .take()
+            .and_then(|e| spawn_stderr_drain(e, c.name.clone(), c.log.clone(), last_err.clone()));
         *lock(&c.child) = Some(child);
         if c.stop.load(Relaxed)
-            && let Some(ch) = lock(&c.child).as_mut() {
-                let _ = ch.kill();
-            }
+            && let Some(ch) = lock(&c.child).as_mut()
+        {
+            let _ = ch.kill();
+        }
         let started = Instant::now();
         let mut frames: u64 = 0;
         let mut clean_eof = false;
         if let Some(mut out) = stdout {
             loop {
-                let mut buf = spare.take().filter(|b| b.len() == c.frame_len).unwrap_or_else(|| vec![0u8; c.frame_len]);
+                let mut buf = spare
+                    .take()
+                    .filter(|b| b.len() == c.frame_len)
+                    .unwrap_or_else(|| vec![0u8; c.frame_len]);
                 match read_full(&mut out, &mut buf) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -1078,8 +1359,15 @@ fn capture_loop(c: CapCfg) {
             backoff = Duration::from_secs(1);
         }
         let le = lock(&last_err).clone();
-        *lock(&c.status) = format!("error: {}", if le.is_empty() { "capture ended" } else { &le });
-        c.log.log(format!("[{}] capture stopped after {frames} frames; retry in {}s", c.name, backoff.as_secs()));
+        *lock(&c.status) = format!(
+            "error: {}",
+            if le.is_empty() { "capture ended" } else { &le }
+        );
+        c.log.log(format!(
+            "[{}] capture stopped after {frames} frames; retry in {}s",
+            c.name,
+            backoff.as_secs()
+        ));
         sleep_interruptible(backoff, &c.stop);
         backoff = (backoff * 2).min(Duration::from_secs(10));
     }
@@ -1136,7 +1424,10 @@ impl Compositor {
             late: AtomicU64::new(0),
         });
         let s2 = sh.clone();
-        let thread = thread::Builder::new().name("compositor".into()).spawn(move || comp_loop(s2, pv)).ok();
+        let thread = thread::Builder::new()
+            .name("compositor".into())
+            .spawn(move || comp_loop(s2, pv))
+            .ok();
         Self { sh, thread }
     }
     fn stop(mut self) {
@@ -1223,12 +1514,17 @@ fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
         let buf = Arc::get_mut(&mut arc).expect("unique canvas buffer");
         let layers = lock(&sh.layers).clone();
         // Hold each slot lock only for an Arc clone.
-        let frames: Vec<Option<Arc<Vec<u8>>>> = layers.iter().map(|l| lock(&l.slot).clone()).collect();
+        let frames: Vec<Option<Arc<Vec<u8>>>> =
+            layers.iter().map(|l| lock(&l.slot).clone()).collect();
         // Skip the 8 MB clear when the bottom layer is opaque and covers the canvas.
         let covered = match (layers.first(), frames.first()) {
             (Some(l), Some(Some(_))) => {
-                l.opacity == 255 && l.opaque.load(Relaxed) && l.x <= 0 && l.y <= 0
-                    && l.x as i64 + l.w as i64 >= cw as i64 && l.y as i64 + l.h as i64 >= ch as i64
+                l.opacity == 255
+                    && l.opaque.load(Relaxed)
+                    && l.x <= 0
+                    && l.y <= 0
+                    && l.x as i64 + l.w as i64 >= cw as i64
+                    && l.y as i64 + l.h as i64 >= ch as i64
             }
             _ => false,
         };
@@ -1270,12 +1566,14 @@ fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
             pool.push(arc.clone());
         }
         *lock(&sh.canvas) = Some(arc);
-        sh.compose_us.store(ts.elapsed().as_micros() as u64, Relaxed);
+        sh.compose_us
+            .store(ts.elapsed().as_micros() as u64, Relaxed);
 
         fps_n += 1;
         let el = fps_t.elapsed();
         if el >= Duration::from_secs(1) {
-            sh.fps_milli.store((fps_n as f64 * 1000.0 / el.as_secs_f64()) as u64, Relaxed);
+            sh.fps_milli
+                .store((fps_n as f64 * 1000.0 / el.as_secs_f64()) as u64, Relaxed);
             fps_t = Instant::now();
             fps_n = 0;
         }
@@ -1314,10 +1612,19 @@ fn audio_inputs(s: &Settings) -> Vec<Vec<String>> {
             "pulse" => a.extend(["-f".into(), "pulse".into(), "-i".into(), d.into()]),
             "alsa" => a.extend(["-f".into(), "alsa".into(), "-i".into(), d.into()]),
             "dshow" => a.extend([
-                "-f".into(), "dshow".into(), "-audio_buffer_size".into(), "50".into(),
-                "-i".into(), format!("audio={d}"),
+                "-f".into(),
+                "dshow".into(),
+                "-audio_buffer_size".into(),
+                "50".into(),
+                "-i".into(),
+                format!("audio={d}"),
             ]),
-            "avfoundation" => a.extend(["-f".into(), "avfoundation".into(), "-i".into(), format!(":{d}")]),
+            "avfoundation" => a.extend([
+                "-f".into(),
+                "avfoundation".into(),
+                "-i".into(),
+                format!(":{d}"),
+            ]),
             _ => continue,
         }
         v.push(a);
@@ -1329,7 +1636,13 @@ fn audio_inputs(s: &Settings) -> Vec<Vec<String>> {
 fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut p = |v: &[&str]| a.extend(v.iter().map(|x| x.to_string()));
-    p(&["-hide_banner", "-loglevel", "warning", "-nostdin", "-nostats"]);
+    p(&[
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-nostdin",
+        "-nostats",
+    ]);
     if kind == OutKind::Record {
         p(&["-n"]); // never overwrite an existing file
     }
@@ -1340,8 +1653,20 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<S
     let size = format!("{}x{}", s.canvas_w, s.canvas_h);
     let fps = s.fps.to_string();
     p(&[
-        "-thread_queue_size", "64", "-use_wallclock_as_timestamps", "1",
-        "-f", "rawvideo", "-pix_fmt", PIX, "-video_size", &size, "-framerate", &fps, "-i", "pipe:0",
+        "-thread_queue_size",
+        "64",
+        "-use_wallclock_as_timestamps",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        PIX,
+        "-video_size",
+        &size,
+        "-framerate",
+        &fps,
+        "-i",
+        "pipe:0",
     ]);
     let auds = audio_inputs(s);
     for ai in &auds {
@@ -1410,7 +1735,9 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<S
 
 fn stream_target(s: &Settings) -> Result<String, String> {
     let url = s.stream_url.trim();
-    let ok = ["rtmp://", "rtmps://", "srt://"].iter().any(|p| url.to_ascii_lowercase().starts_with(p));
+    let ok = ["rtmp://", "rtmps://", "srt://"]
+        .iter()
+        .any(|p| url.to_ascii_lowercase().starts_with(p));
     if !ok {
         return Err("Stream URL must start with rtmp://, rtmps:// or srt://".into());
     }
@@ -1433,15 +1760,17 @@ fn secrets_of(s: &Settings) -> Vec<String> {
     // rtmp://user:pass@host — redact userinfo; srt passphrase in query string.
     let u = s.stream_url.trim();
     if let Some(rest) = u.split_once("://").map(|x| x.1)
-        && let Some((ui, _)) = rest.split_once('@') {
-            v.push(ui.to_string());
-        }
+        && let Some((ui, _)) = rest.split_once('@')
+    {
+        v.push(ui.to_string());
+    }
     if let Some((_, q)) = u.split_once('?') {
         for kv in q.split('&') {
             if let Some((k, val)) = kv.split_once('=')
-                && (k.eq_ignore_ascii_case("passphrase") || k.eq_ignore_ascii_case("streamid")) {
-                    v.push(val.to_string());
-                }
+                && (k.eq_ignore_ascii_case("passphrase") || k.eq_ignore_ascii_case("streamid"))
+            {
+                v.push(val.to_string());
+            }
         }
     }
     v
@@ -1461,15 +1790,35 @@ struct OutputSession {
 }
 
 impl OutputSession {
-    fn start(kind: OutKind, s: &Settings, ff: &FfInfo, comp: &Arc<CompShared>, log: &Logger, target: &str, label: String) -> Result<Self, String> {
+    fn start(
+        kind: OutKind,
+        s: &Settings,
+        ff: &FfInfo,
+        comp: &Arc<CompShared>,
+        log: &Logger,
+        target: &str,
+        label: String,
+    ) -> Result<Self, String> {
         let args = encoder_args(s, ff, kind, target);
         let mut cmd = ffmpeg_cmd(&s.ffmpeg_path);
-        cmd.args(&args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("cannot start ffmpeg ({}): {e}", s.ffmpeg_path))?;
+        cmd.args(&args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("cannot start ffmpeg ({}): {e}", s.ffmpeg_path))?;
         let stdin = child.stdin.take().ok_or("no stdin pipe")?;
-        let tag = if kind == OutKind::Record { "rec" } else { "stream" };
+        let tag = if kind == OutKind::Record {
+            "rec"
+        } else {
+            "stream"
+        };
         let last_err = Arc::new(Mutex::new(String::new()));
-        let drain = child.stderr.take().and_then(|e| spawn_stderr_drain(e, tag.into(), log.clone(), last_err.clone()));
+        let drain = child
+            .stderr
+            .take()
+            .and_then(|e| spawn_stderr_drain(e, tag.into(), log.clone(), last_err.clone()));
         let sess = Self {
             kind,
             child: Arc::new(Mutex::new(Some(child))),
@@ -1482,7 +1831,13 @@ impl OutputSession {
             last_err,
             label,
         };
-        let (stop, dead, frames, comp2, log2) = (sess.stop.clone(), sess.dead.clone(), sess.frames.clone(), comp.clone(), log.clone());
+        let (stop, dead, frames, comp2, log2) = (
+            sess.stop.clone(),
+            sess.dead.clone(),
+            sess.frames.clone(),
+            comp.clone(),
+            log.clone(),
+        );
         let mut sess = sess;
         sess.writer = Some(
             thread::Builder::new()
@@ -1511,16 +1866,21 @@ impl OutputSession {
             .name("stopper".into())
             .spawn(move || {
                 self.stop.store(true, Relaxed);
-                let tag = if self.kind == OutKind::Record { "rec" } else { "stream" };
+                let tag = if self.kind == OutKind::Record {
+                    "rec"
+                } else {
+                    "stream"
+                };
                 if let Some(w) = self.writer.take() {
                     let t = Instant::now();
                     while !w.is_finished() && t.elapsed() < Duration::from_secs(3) {
                         thread::sleep(Duration::from_millis(20));
                     }
                     if !w.is_finished()
-                        && let Some(c) = lock(&self.child).as_mut() {
-                            let _ = c.kill(); // writer blocked on a stalled encoder
-                        }
+                        && let Some(c) = lock(&self.child).as_mut()
+                    {
+                        let _ = c.kill(); // writer blocked on a stalled encoder
+                    }
                     let _ = w.join();
                 }
                 let mut graceful = false;
@@ -1532,7 +1892,9 @@ impl OutputSession {
                                 graceful = true;
                                 break;
                             }
-                            Ok(None) if t.elapsed() < Duration::from_secs(15) => thread::sleep(Duration::from_millis(50)),
+                            Ok(None) if t.elapsed() < Duration::from_secs(15) => {
+                                thread::sleep(Duration::from_millis(50))
+                            }
                             _ => {
                                 let _ = c.kill();
                                 let _ = c.wait();
@@ -1548,14 +1910,26 @@ impl OutputSession {
                     "[{tag}] stopped ({} frames, {}){}",
                     self.frames.load(Relaxed),
                     fmt_dur(self.started.elapsed()),
-                    if graceful { "" } else { " — encoder had to be killed" }
+                    if graceful {
+                        ""
+                    } else {
+                        " — encoder had to be killed"
+                    }
                 ));
             })
             .ok()
     }
 }
 
-fn writer_loop(mut stdin: ChildStdin, comp: Arc<CompShared>, stop: Arc<AtomicBool>, dead: Arc<AtomicBool>, frames: Arc<AtomicU64>, log: Logger, tag: &str) {
+fn writer_loop(
+    mut stdin: ChildStdin,
+    comp: Arc<CompShared>,
+    stop: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
+    frames: Arc<AtomicU64>,
+    log: Logger,
+    tag: &str,
+) {
     let period_ns = 1_000_000_000u64 / comp.fps.max(1) as u64;
     let mut t0 = Instant::now();
     let mut n: u64 = 0;
@@ -1606,10 +1980,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 /// UTC timestamp for filenames (no chrono dependency).
 fn utc_stamp() -> String {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
     let sod = secs.rem_euclid(86_400);
-    format!("{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}Z", sod / 3600, (sod % 3600) / 60, sod % 60)
+    format!(
+        "{y:04}-{m:02}-{d:02}_{:02}-{:02}-{:02}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
 }
 
 fn unique_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
@@ -1769,14 +2151,49 @@ fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
         let q = q.clone();
         mb.add(path, sc, MenuFlag::Normal, move |_| q.send(m.clone()));
     };
-    add(&mut mb, "&File/&Save Profile", Shortcut::Ctrl | 's', Msg::SaveProfile);
-    add(&mut mb, "&File/Save Profile &As…", Shortcut::Ctrl | Shortcut::Shift | 's', Msg::SaveProfileAs);
-    add(&mut mb, "&File/&Load Profile…", Shortcut::Ctrl | 'o', Msg::LoadProfile);
+    add(
+        &mut mb,
+        "&File/&Save Profile",
+        Shortcut::Ctrl | 's',
+        Msg::SaveProfile,
+    );
+    add(
+        &mut mb,
+        "&File/Save Profile &As…",
+        Shortcut::Ctrl | Shortcut::Shift | 's',
+        Msg::SaveProfileAs,
+    );
+    add(
+        &mut mb,
+        "&File/&Load Profile…",
+        Shortcut::Ctrl | 'o',
+        Msg::LoadProfile,
+    );
     add(&mut mb, "&File/&Quit", Shortcut::Ctrl | 'q', Msg::Quit);
-    add(&mut mb, "&Controls/Toggle &Recording", Shortcut::Ctrl | 'r', Msg::ToggleRecord);
-    add(&mut mb, "&Controls/Toggle &Streaming", Shortcut::Ctrl | 'l', Msg::ToggleStream);
-    add(&mut mb, "&Controls/Screens&hot", Shortcut::None | Key::F12, Msg::Screenshot);
-    add(&mut mb, "&Controls/S&ettings…", Shortcut::Ctrl | ',', Msg::Settings);
+    add(
+        &mut mb,
+        "&Controls/Toggle &Recording",
+        Shortcut::Ctrl | 'r',
+        Msg::ToggleRecord,
+    );
+    add(
+        &mut mb,
+        "&Controls/Toggle &Streaming",
+        Shortcut::Ctrl | 'l',
+        Msg::ToggleStream,
+    );
+    add(
+        &mut mb,
+        "&Controls/Screens&hot",
+        Shortcut::None | Key::F12,
+        Msg::Screenshot,
+    );
+    add(
+        &mut mb,
+        "&Controls/S&ettings…",
+        Shortcut::Ctrl | ',',
+        Msg::Settings,
+    );
     add(&mut mb, "&Help/&About", Shortcut::None, Msg::About);
     main.fixed(&mb, 26);
 
@@ -1797,7 +2214,12 @@ fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
             {
                 let g = lock(&pv.buf);
                 if g.1 > 0 && g.2 > 0 && g.0.len() >= g.1 * g.2 * 3 {
-                    if let Ok(mut img) = RgbImage::new(&g.0[..g.1 * g.2 * 3], g.1 as i32, g.2 as i32, ColorDepth::Rgb8) {
+                    if let Ok(mut img) = RgbImage::new(
+                        &g.0[..g.1 * g.2 * 3],
+                        g.1 as i32,
+                        g.2 as i32,
+                        ColorDepth::Rgb8,
+                    ) {
                         if g.1 as i32 != pw || g.2 as i32 != ph {
                             img.scale(pw, ph, false, true);
                         }
@@ -1992,7 +2414,23 @@ fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
             }
         });
     }
-    Ui { win, preview, scenes, sources, px, py, pw, ph, opac, btn_rec, btn_stream, status, src_status, logbuf, logview }
+    Ui {
+        win,
+        preview,
+        scenes,
+        sources,
+        px,
+        py,
+        pw,
+        ph,
+        opac,
+        btn_rec,
+        btn_stream,
+        status,
+        src_status,
+        logbuf,
+        logview,
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2018,7 +2456,11 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
     let mut win = Window::default()
         .with_size(580, 440)
         .center_screen()
-        .with_label(if init.is_some() { "Edit Source" } else { "Add Source" });
+        .with_label(if init.is_some() {
+            "Edit Source"
+        } else {
+            "Add Source"
+        });
     let mut name = Input::new(170, 14, 390, 26, "Name:");
     let mut kind = Choice::new(170, 48, 390, 26, "Type:");
     kind.add_choice("Display Capture|Webcam \\/ Video Device|Media File|Image|Color");
@@ -2049,16 +2491,28 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
     let mut mons: Vec<(String, String)> = screens
         .iter()
         .enumerate()
-        .map(|(i, (x, y, w, h))| (i.to_string(), format!("Screen {}: {}x{} at {},{}", i + 1, w, h, x, y)))
+        .map(|(i, (x, y, w, h))| {
+            (
+                i.to_string(),
+                format!("Screen {}: {}x{} at {},{}", i + 1, w, h, x, y),
+            )
+        })
         .collect();
-    let union = screens.iter().fold(None::<(i32, i32, i32, i32)>, |acc, &(x, y, w, h)| match acc {
-        None => Some((x, y, x + w, y + h)),
-        Some((a, b, c, d)) => Some((a.min(x), b.min(y), c.max(x + w), d.max(y + h))),
-    });
+    let union = screens.iter().fold(
+        None::<(i32, i32, i32, i32)>,
+        |acc, &(x, y, w, h)| match acc {
+            None => Some((x, y, x + w, y + h)),
+            Some((a, b, c, d)) => Some((a.min(x), b.min(y), c.max(x + w), d.max(y + h))),
+        },
+    );
     if screens.len() > 1
-        && let Some((a, b, c, d)) = union {
-            mons.push(("all".into(), format!("All screens: {}x{} at {},{}", c - a, d - b, a, b)));
-        }
+        && let Some((a, b, c, d)) = union
+    {
+        mons.push((
+            "all".into(),
+            format!("All screens: {}x{} at {},{}", c - a, d - b, a, b),
+        ));
+    }
     fill_choice(&mut monitor, &mons);
 
     let color = Rc::new(Cell::new((40u8, 40u8, 48u8)));
@@ -2079,7 +2533,14 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
             name.set_value(&s.name);
             kind.set_value(s.kind.index());
             match &s.kind {
-                SourceKind::Display { target: t, x, y, w, h, cursor: c } => {
+                SourceKind::Display {
+                    target: t,
+                    x,
+                    y,
+                    w,
+                    h,
+                    cursor: c,
+                } => {
                     target.set_value(t);
                     rx.set_value(&x.to_string());
                     ry.set_value(&y.to_string());
@@ -2113,14 +2574,23 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
     swatch.set_color(Color::from_rgb(r, g, b));
 
     {
-        let (mut rx, mut ry, mut rw, mut rh, mons) = (rx.clone(), ry.clone(), rw.clone(), rh.clone(), mons.clone());
+        let (mut rx, mut ry, mut rw, mut rh, mons) =
+            (rx.clone(), ry.clone(), rw.clone(), rh.clone(), mons.clone());
         let screens = screens.clone();
         monitor.set_callback(move |c| {
             let i = c.value();
-            if i < 0 { return; }
+            if i < 0 {
+                return;
+            }
             let (x, y, w, h) = match mons.get(i as usize).map(|m| m.0.as_str()) {
-                Some("all") => match union { Some((a, b, c2, d)) => (a, b, c2 - a, d - b), None => return },
-                Some(_) => match screens.get(i as usize) { Some(s) => *s, None => return },
+                Some("all") => match union {
+                    Some((a, b, c2, d)) => (a, b, c2 - a, d - b),
+                    None => return,
+                },
+                Some(_) => match screens.get(i as usize) {
+                    Some(s) => *s,
+                    None => return,
+                },
                 None => return,
             };
             rx.set_value(&x.to_string());
@@ -2159,7 +2629,11 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
         detect_btn.set_callback(move |_| {
             draw::set_cursor(fltk::enums::Cursor::Wait);
             app::flush();
-            let list = if kind.value() == 1 { detect_video_devices(&ff) } else { vec![] };
+            let list = if kind.value() == 1 {
+                detect_video_devices(&ff)
+            } else {
+                vec![]
+            };
             draw::set_cursor(fltk::enums::Cursor::Default);
             fill_choice(&mut detected, &list);
             if list.is_empty() {
@@ -2173,7 +2647,8 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
     {
         let (color, mut swatch) = (color.clone(), swatch.clone());
         color_btn.set_callback(move |_| {
-            if let Some((r, g, b)) = dialog::color_chooser("Source colour", dialog::ColorMode::Byte) {
+            if let Some((r, g, b)) = dialog::color_chooser("Source colour", dialog::ColorMode::Byte)
+            {
                 color.set((r, g, b));
                 swatch.set_color(Color::from_rgb(r, g, b));
                 swatch.redraw();
@@ -2196,9 +2671,19 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
     }
 
     let names = ["Display Capture", "Webcam", "Media", "Image", "Color"];
-    let update = |k: i32, target: &mut Input, browse: &mut Button, detected: &mut Choice, detect_btn: &mut Button,
-                  monitor: &mut Choice, reg: &mut [&mut IntInput; 4], cursor: &mut CheckButton, looping: &mut CheckButton,
-                  wsize: &mut Input, wfps: &mut IntInput, color_btn: &mut Button, hint: &mut Frame| {
+    let update = |k: i32,
+                  target: &mut Input,
+                  browse: &mut Button,
+                  detected: &mut Choice,
+                  detect_btn: &mut Button,
+                  monitor: &mut Choice,
+                  reg: &mut [&mut IntInput; 4],
+                  cursor: &mut CheckButton,
+                  looping: &mut CheckButton,
+                  wsize: &mut Input,
+                  wfps: &mut IntInput,
+                  color_btn: &mut Button,
+                  hint: &mut Frame| {
         let on = |w: &mut dyn WidgetExt, b: bool| if b { w.activate() } else { w.deactivate() };
         on(target, k != 4);
         on(browse, k == 2 || k == 3);
@@ -2234,17 +2719,36 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
                 // Swap default target when the user changes type on a fresh source.
                 if last_k >= 0 {
                     let t = target.value();
-                    let was_default = t.is_empty() || t == default_display_target() || t == default_webcam_target();
+                    let was_default = t.is_empty()
+                        || t == default_display_target()
+                        || t == default_webcam_target();
                     if was_default {
-                        target.set_value(&match k { 0 => default_display_target(), 1 => default_webcam_target(), _ => String::new() });
+                        target.set_value(&match k {
+                            0 => default_display_target(),
+                            1 => default_webcam_target(),
+                            _ => String::new(),
+                        });
                     }
                     if names.contains(&name.value().as_str()) {
                         name.set_value(names[k.clamp(0, 4) as usize]);
                     }
                 }
                 let (mut a, mut b, mut c, mut d) = (rx.clone(), ry.clone(), rw.clone(), rh.clone());
-                update(k, &mut target, &mut browse, &mut detected, &mut detect_btn, &mut monitor, &mut [&mut a, &mut b, &mut c, &mut d],
-                       &mut cursor, &mut looping, &mut wsize, &mut wfps, &mut color_btn, &mut hint);
+                update(
+                    k,
+                    &mut target,
+                    &mut browse,
+                    &mut detected,
+                    &mut detect_btn,
+                    &mut monitor,
+                    &mut [&mut a, &mut b, &mut c, &mut d],
+                    &mut cursor,
+                    &mut looping,
+                    &mut wsize,
+                    &mut wfps,
+                    &mut color_btn,
+                    &mut hint,
+                );
                 last_k = k;
             }
         }
@@ -2257,10 +2761,21 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
         let pi = |i: &IntInput| i.value().trim().parse::<i64>().ok();
         let res: Result<SourceKind, String> = match kind.value() {
             0 => match (pi(&rx), pi(&ry), pi(&rw), pi(&rh)) {
-                (Some(x), Some(y), Some(w), Some(h)) if (1..=16384).contains(&w) && (1..=16384).contains(&h)
-                    && (-32768..=32767).contains(&x) && (-32768..=32767).contains(&y) => Ok(SourceKind::Display {
-                    target: t, x: x as i32, y: y as i32, w: w as u32, h: h as u32, cursor: cursor.is_checked(),
-                }),
+                (Some(x), Some(y), Some(w), Some(h))
+                    if (1..=16384).contains(&w)
+                        && (1..=16384).contains(&h)
+                        && (-32768..=32767).contains(&x)
+                        && (-32768..=32767).contains(&y) =>
+                {
+                    Ok(SourceKind::Display {
+                        target: t,
+                        x: x as i32,
+                        y: y as i32,
+                        w: w as u32,
+                        h: h as u32,
+                        cursor: cursor.is_checked(),
+                    })
+                }
                 _ => Err("Region must be numeric; W/H between 1 and 16384.".into()),
             },
             1 => {
@@ -2271,11 +2786,18 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
                     Err("Webcam size must look like 1280x720.".into())
                 } else {
                     let f = pi(&wfps).unwrap_or(0).clamp(0, MAX_FPS as i64) as u32;
-                    Ok(SourceKind::Webcam { device: t, size: sz, fps: f })
+                    Ok(SourceKind::Webcam {
+                        device: t,
+                        size: sz,
+                        fps: f,
+                    })
                 }
             }
             2 if t.is_empty() => Err("Choose a media file.".into()),
-            2 => Ok(SourceKind::Media { path: t, looping: looping.is_checked() }),
+            2 => Ok(SourceKind::Media {
+                path: t,
+                looping: looping.is_checked(),
+            }),
             3 if t.is_empty() => Err("Choose an image file.".into()),
             3 => Ok(SourceKind::Image { path: t }),
             _ => {
@@ -2285,7 +2807,11 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
         };
         match res {
             Ok(k) => {
-                let nm = if nm.is_empty() { k.label().to_string() } else { nm };
+                let nm = if nm.is_empty() {
+                    k.label().to_string()
+                } else {
+                    nm
+                };
                 return Some((nm, k));
             }
             Err(e) => dialog::alert_default(&e),
@@ -2294,7 +2820,10 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
 }
 
 fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
-    let mut win = Window::default().with_size(640, 620).center_screen().with_label("Settings");
+    let mut win = Window::default()
+        .with_size(640, 620)
+        .center_screen()
+        .with_label("Settings");
     let x = 190;
     let mut y = 14;
     let mut row = |h: i32| {
@@ -2318,7 +2847,13 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
     let mut recbrowse = Button::new(x + 340, r, 90, 26, "Browse…");
     let r = row(26);
     let mut fmt = Choice::new(x, r, 100, 26, "Recording format:");
-    let mut fmt_hint = Frame::new(x + 110, r, 320, 26, "mkv survives crashes; remux to mp4 later");
+    let mut fmt_hint = Frame::new(
+        x + 110,
+        r,
+        320,
+        26,
+        "mkv survives crashes; remux to mp4 later",
+    );
     fmt_hint.set_label_size(11);
     fmt_hint.set_align(Align::Left | Align::Inside);
     let r = row(26);
@@ -2346,12 +2881,18 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
     info.set_label_size(11);
     let enc_list: Vec<String> = ENCODERS
         .iter()
-        .filter(|e| !ff.ok || ff.encoders.is_empty() || ff.encoders.contains(**e) || **e == cur.encoder)
+        .filter(|e| {
+            !ff.ok || ff.encoders.is_empty() || ff.encoders.contains(**e) || **e == cur.encoder
+        })
         .map(|e| e.to_string())
         .collect();
     info.set_label(&label_escape(&format!(
         "{}\nAvailable H.264 encoders in this ffmpeg: {}. Leave a device blank to disable it.",
-        if ff.ok { ff.version.as_str() } else { "ffmpeg NOT FOUND — set the binary path above." },
+        if ff.ok {
+            ff.version.as_str()
+        } else {
+            "ffmpeg NOT FOUND — set the binary path above."
+        },
         enc_list.join(", ")
     )));
     let mut ok = Button::new(430, 576, 90, 30, "OK");
@@ -2366,17 +2907,32 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
     }
     enc.set_value(enc_list.iter().position(|e| *e == cur.encoder).unwrap_or(0) as i32);
     preset.add_choice(&X264_PRESETS.join("|"));
-    preset.set_value(X264_PRESETS.iter().position(|p| *p == cur.x264_preset).unwrap_or(2) as i32);
+    preset.set_value(
+        X264_PRESETS
+            .iter()
+            .position(|p| *p == cur.x264_preset)
+            .unwrap_or(2) as i32,
+    );
     vk.set_value(&cur.video_kbps.to_string());
     ak.set_value(&cur.audio_kbps.to_string());
     ki.set_value(&cur.keyint_sec.to_string());
     recdir.set_value(&cur.rec_dir);
     fmt.add_choice(&REC_FORMATS.join("|"));
-    fmt.set_value(REC_FORMATS.iter().position(|p| *p == cur.rec_format).unwrap_or(0) as i32);
+    fmt.set_value(
+        REC_FORMATS
+            .iter()
+            .position(|p| *p == cur.rec_format)
+            .unwrap_or(0) as i32,
+    );
     url.set_value(&cur.stream_url);
     key.set_value(&cur.stream_key);
     api.add_choice(&AUDIO_APIS.join("|"));
-    api.set_value(AUDIO_APIS.iter().position(|p| *p == cur.audio_api).unwrap_or(0) as i32);
+    api.set_value(
+        AUDIO_APIS
+            .iter()
+            .position(|p| *p == cur.audio_api)
+            .unwrap_or(0) as i32,
+    );
     mic.set_value(&cur.mic_device);
     desk.set_value(&cur.desktop_device);
     ffp.set_value(&cur.ffmpeg_path);
@@ -2420,7 +2976,10 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
         let (api, ffp, devs) = (api.clone(), ffp.clone(), devs.clone());
         let (mut mp, mut dp) = (mic_pick.clone(), desk_pick.clone());
         detect_btn.set_callback(move |_| {
-            let a = AUDIO_APIS.get(api.value().max(0) as usize).copied().unwrap_or("none");
+            let a = AUDIO_APIS
+                .get(api.value().max(0) as usize)
+                .copied()
+                .unwrap_or("none");
             draw::set_cursor(fltk::enums::Cursor::Wait);
             app::flush();
             let list = detect_audio_devices(a, &ffp.value());
@@ -2489,10 +3048,22 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
             Some(v) if (1..=20).contains(&v) => s.keyint_sec = v,
             _ => errs.push("Keyframe interval must be 1..20 s.".into()),
         }
-        s.encoder = enc_list.get(enc.value().max(0) as usize).cloned().unwrap_or_else(|| "libx264".into());
-        s.x264_preset = X264_PRESETS.get(preset.value().max(0) as usize).unwrap_or(&"veryfast").to_string();
-        s.rec_format = REC_FORMATS.get(fmt.value().max(0) as usize).unwrap_or(&"mkv").to_string();
-        s.audio_api = AUDIO_APIS.get(api.value().max(0) as usize).unwrap_or(&"none").to_string();
+        s.encoder = enc_list
+            .get(enc.value().max(0) as usize)
+            .cloned()
+            .unwrap_or_else(|| "libx264".into());
+        s.x264_preset = X264_PRESETS
+            .get(preset.value().max(0) as usize)
+            .unwrap_or(&"veryfast")
+            .to_string();
+        s.rec_format = REC_FORMATS
+            .get(fmt.value().max(0) as usize)
+            .unwrap_or(&"mkv")
+            .to_string();
+        s.audio_api = AUDIO_APIS
+            .get(api.value().max(0) as usize)
+            .unwrap_or(&"none")
+            .to_string();
         s.rec_dir = recdir.value().trim().to_string();
         s.stream_url = url.value().trim().to_string();
         s.stream_key = key.value().trim().to_string();
@@ -2504,9 +3075,10 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
             errs.push("ffmpeg binary path is required.".into());
         }
         if !s.stream_url.is_empty()
-            && let Err(e) = stream_target(&s) {
-                errs.push(e);
-            }
+            && let Err(e) = stream_target(&s)
+        {
+            errs.push(e);
+        }
         if errs.is_empty() {
             return Some(s);
         }
@@ -2575,7 +3147,12 @@ impl AppState {
             o.cw = s.canvas_w;
             o.ch = s.canvas_h;
         }
-        self.comp = Some(Compositor::start(s.canvas_w, s.canvas_h, s.fps, self.pv.clone()));
+        self.comp = Some(Compositor::start(
+            s.canvas_w,
+            s.canvas_h,
+            s.fps,
+            self.pv.clone(),
+        ));
         self.apply_scene();
     }
     fn stop_pipeline(&mut self) {
@@ -2590,7 +3167,10 @@ impl AppState {
     /// Start/stop source processes so exactly the current scene's visible
     /// sources run, then publish the new layer list.
     fn apply_scene(&mut self) {
-        let (fps, ff) = (self.prof.settings.fps, self.prof.settings.ffmpeg_path.clone());
+        let (fps, ff) = (
+            self.prof.settings.fps,
+            self.prof.settings.ffmpeg_path.clone(),
+        );
         let want: Vec<(String, Source)> = self
             .scene()
             .sources
@@ -2599,16 +3179,26 @@ impl AppState {
             .map(|s| (source_sig(s, fps, &ff), s.clone()))
             .collect();
         let keep: HashSet<&String> = want.iter().map(|(k, _)| k).collect();
-        let dead: Vec<String> = self.runtimes.keys().filter(|k| !keep.contains(k)).cloned().collect();
+        let dead: Vec<String> = self
+            .runtimes
+            .keys()
+            .filter(|k| !keep.contains(k))
+            .cloned()
+            .collect();
         for k in dead {
             if let Some(rt) = self.runtimes.remove(&k) {
                 rt.stop();
             }
         }
-        let ctx = RtCtx { ffmpeg: ff, fps, log: self.log.clone() };
+        let ctx = RtCtx {
+            ffmpeg: ff,
+            fps,
+            log: self.log.clone(),
+        };
         for (k, s) in &want {
             if !self.runtimes.contains_key(k) {
-                self.runtimes.insert(k.clone(), SourceRuntime::start(s, &ctx));
+                self.runtimes
+                    .insert(k.clone(), SourceRuntime::start(s, &ctx));
             }
         }
         self.publish_layers();
@@ -2616,7 +3206,10 @@ impl AppState {
 
     /// Cheap: re-publish positions/opacity without touching processes.
     fn publish_layers(&mut self) {
-        let (fps, ff) = (self.prof.settings.fps, self.prof.settings.ffmpeg_path.clone());
+        let (fps, ff) = (
+            self.prof.settings.fps,
+            self.prof.settings.ffmpeg_path.clone(),
+        );
         let layers: Vec<Layer> = self
             .scene()
             .sources
@@ -2624,7 +3217,15 @@ impl AppState {
             .filter(|s| s.visible)
             .filter_map(|s| {
                 let rt = self.runtimes.get(&source_sig(s, fps, &ff))?;
-                Some(Layer { x: s.x, y: s.y, w: s.w, h: s.h, opacity: s.opacity, slot: rt.slot.clone(), opaque: rt.opaque.clone() })
+                Some(Layer {
+                    x: s.x,
+                    y: s.y,
+                    w: s.w,
+                    h: s.h,
+                    opacity: s.opacity,
+                    slot: rt.slot.clone(),
+                    opaque: rt.opaque.clone(),
+                })
             })
             .collect();
         if let Some(c) = &self.comp {
@@ -2665,7 +3266,12 @@ impl AppState {
         b.clear();
         let mut line = 0;
         for (i, s) in srcs.iter().enumerate().rev() {
-            b.add(&format!("@.{} {}  [{}]", if s.visible { "●" } else { "○" }, s.name, s.kind.label()));
+            b.add(&format!(
+                "@.{} {}  [{}]",
+                if s.visible { "●" } else { "○" },
+                s.name,
+                s.kind.label()
+            ));
             if Some(s.id) == sel {
                 line = (srcs.len() - i) as i32;
             }
@@ -2684,7 +3290,8 @@ impl AppState {
                 ui.py.set_value(&s.y.to_string());
                 ui.pw.set_value(&s.w.to_string());
                 ui.ph.set_value(&s.h.to_string());
-                ui.opac.set_value((s.opacity as f64 * 100.0 / 255.0).round());
+                ui.opac
+                    .set_value((s.opacity as f64 * 100.0 / 255.0).round());
             }
             None => {
                 for i in [&mut ui.px, &mut ui.py, &mut ui.pw, &mut ui.ph] {
@@ -2702,13 +3309,33 @@ impl AppState {
         let rec = self.rec.is_some();
         let live = self.stream.is_some() || self.stream_retry.is_some();
         let b = &mut self.ui.btn_rec;
-        b.set_label(if rec { "Stop Recording" } else { "Start Recording" });
-        b.set_color(if rec { Color::from_rgb(200, 50, 50) } else { Color::BackGround });
+        b.set_label(if rec {
+            "Stop Recording"
+        } else {
+            "Start Recording"
+        });
+        b.set_color(if rec {
+            Color::from_rgb(200, 50, 50)
+        } else {
+            Color::BackGround
+        });
         b.set_label_color(if rec { Color::White } else { Color::Foreground });
         let b = &mut self.ui.btn_stream;
-        b.set_label(if live { "Stop Streaming" } else { "Start Streaming" });
-        b.set_color(if live { Color::from_rgb(50, 110, 200) } else { Color::BackGround });
-        b.set_label_color(if live { Color::White } else { Color::Foreground });
+        b.set_label(if live {
+            "Stop Streaming"
+        } else {
+            "Start Streaming"
+        });
+        b.set_color(if live {
+            Color::from_rgb(50, 110, 200)
+        } else {
+            Color::BackGround
+        });
+        b.set_label_color(if live {
+            Color::White
+        } else {
+            Color::Foreground
+        });
         self.ui.btn_rec.redraw();
         self.ui.btn_stream.redraw();
     }
@@ -2727,12 +3354,23 @@ impl AppState {
     }
 
     fn next_id(&self) -> u64 {
-        self.prof.scenes.iter().flat_map(|s| s.sources.iter().map(|x| x.id)).max().unwrap_or(0) + 1
+        self.prof
+            .scenes
+            .iter()
+            .flat_map(|s| s.sources.iter().map(|x| x.id))
+            .max()
+            .unwrap_or(0)
+            + 1
     }
 
     fn canvas_xy(&self, mx: i32, my: i32) -> Option<(i32, i32)> {
         let s = &self.prof.settings;
-        let (ox, oy, pw, ph) = fit_rect(s.canvas_w, s.canvas_h, self.ui.preview.w(), self.ui.preview.h());
+        let (ox, oy, pw, ph) = fit_rect(
+            s.canvas_w,
+            s.canvas_h,
+            self.ui.preview.w(),
+            self.ui.preview.h(),
+        );
         if pw <= 0 || ph <= 0 {
             return None;
         }
@@ -2750,7 +3388,15 @@ impl AppState {
         fs::create_dir_all(&dir).map_err(|e| format!("recording folder {}: {e}", dir.display()))?;
         let path = unique_path(&dir, &format!("litecast_{}", utc_stamp()), &s.rec_format);
         let p = path.to_string_lossy().into_owned();
-        let sess = OutputSession::start(OutKind::Record, &s, &self.ff, &comp, &self.log, &p, p.clone())?;
+        let sess = OutputSession::start(
+            OutKind::Record,
+            &s,
+            &self.ff,
+            &comp,
+            &self.log,
+            &p,
+            p.clone(),
+        )?;
         self.rec = Some(sess);
         self.rec_path = Some(path);
         Ok(())
@@ -2771,16 +3417,25 @@ impl AppState {
         let target = stream_target(&s)?;
         self.log.set_secrets(secrets_of(&s));
         let label = s.stream_url.split('?').next().unwrap_or("").to_string() + " (key hidden)";
-        self.stream = Some(OutputSession::start(OutKind::Stream, &s, &self.ff, &comp, &self.log, &target, label)?);
+        self.stream = Some(OutputSession::start(
+            OutKind::Stream,
+            &s,
+            &self.ff,
+            &comp,
+            &self.log,
+            &target,
+            label,
+        )?);
         Ok(())
     }
     fn stop_stream(&mut self) {
         self.stream_retry = None;
         self.stream_user_on = false;
         if let Some(r) = self.stream.take()
-            && let Some(h) = r.begin_stop(self.log.clone()) {
-                self.stoppers.push(h);
-            }
+            && let Some(h) = r.begin_stop(self.log.clone())
+        {
+            self.stoppers.push(h);
+        }
     }
 
     fn screenshot(&mut self) {
@@ -2794,16 +3449,32 @@ impl AppState {
         let _ = fs::create_dir_all(&dir);
         let path = unique_path(&dir, &format!("litecast_shot_{}", utc_stamp()), "png");
         let args: Vec<String> = vec![
-            "-hide_banner".into(), "-loglevel".into(), "error".into(), "-n".into(),
-            "-f".into(), "rawvideo".into(), "-pix_fmt".into(), PIX.into(),
-            "-video_size".into(), format!("{}x{}", c.sh.cw, c.sh.ch), "-i".into(), "pipe:0".into(),
-            "-frames:v".into(), "1".into(), file_arg(&path.to_string_lossy()),
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-n".into(),
+            "-f".into(),
+            "rawvideo".into(),
+            "-pix_fmt".into(),
+            PIX.into(),
+            "-video_size".into(),
+            format!("{}x{}", c.sh.cw, c.sh.ch),
+            "-i".into(),
+            "pipe:0".into(),
+            "-frames:v".into(),
+            "1".into(),
+            file_arg(&path.to_string_lossy()),
         ];
         let (ff, log) = (s.ffmpeg_path.clone(), self.log.clone());
-        let h = thread::spawn(move || match run_tool(&ff, &args, Some(frame), 1024, Duration::from_secs(20), None) {
-            Ok((_, _, Some(0))) => log.log(format!("screenshot saved: {}", path.display())),
-            Ok((_, e, _)) => log.log(format!("screenshot failed: {}", truncate_chars(e.trim(), 200))),
-            Err(e) => log.log(format!("screenshot failed: {e}")),
+        let h = thread::spawn(move || {
+            match run_tool(&ff, &args, Some(frame), 1024, Duration::from_secs(20), None) {
+                Ok((_, _, Some(0))) => log.log(format!("screenshot saved: {}", path.display())),
+                Ok((_, e, _)) => log.log(format!(
+                    "screenshot failed: {}",
+                    truncate_chars(e.trim(), 200)
+                )),
+                Err(e) => log.log(format!("screenshot failed: {e}")),
+            }
         });
         self.stoppers.push(h);
     }
@@ -2812,31 +3483,68 @@ impl AppState {
     fn tick(&mut self) {
         // Request preview size matching the widget.
         let s = &self.prof.settings;
-        let (_, _, pw, ph) = fit_rect(s.canvas_w, s.canvas_h, self.ui.preview.w(), self.ui.preview.h());
-        self.pv.req.store(((pw.max(0) as u64) << 32) | ph.max(0) as u64, Relaxed);
+        let (_, _, pw, ph) = fit_rect(
+            s.canvas_w,
+            s.canvas_h,
+            self.ui.preview.w(),
+            self.ui.preview.h(),
+        );
+        self.pv
+            .req
+            .store(((pw.max(0) as u64) << 32) | ph.max(0) as u64, Relaxed);
 
         // Output health.
         if self.rec.as_ref().map(|r| !r.alive()).unwrap_or(false) {
-            let err = self.rec.as_ref().map(|r| lock(&r.last_err).clone()).unwrap_or_default();
-            self.log.log(format!("[rec] encoder exited unexpectedly: {err}"));
-            if self.rec.as_ref().map(|r| r.started.elapsed() < Duration::from_secs(5)).unwrap_or(false) && !self.prof.settings.mic_device.is_empty() {
-                self.log.log("[rec] hint: check the audio devices in Settings (or set backend to 'none').");
+            let err = self
+                .rec
+                .as_ref()
+                .map(|r| lock(&r.last_err).clone())
+                .unwrap_or_default();
+            self.log
+                .log(format!("[rec] encoder exited unexpectedly: {err}"));
+            if self
+                .rec
+                .as_ref()
+                .map(|r| r.started.elapsed() < Duration::from_secs(5))
+                .unwrap_or(false)
+                && !self.prof.settings.mic_device.is_empty()
+            {
+                self.log.log(
+                    "[rec] hint: check the audio devices in Settings (or set backend to 'none').",
+                );
             }
             self.stop_record();
             self.update_buttons();
         }
         if self.stream.as_ref().map(|r| !r.alive()).unwrap_or(false) {
-            let ok_for = self.stream.as_ref().map(|r| r.started.elapsed()).unwrap_or_default();
-            let err = self.stream.as_ref().map(|r| lock(&r.last_err).clone()).unwrap_or_default();
+            let ok_for = self
+                .stream
+                .as_ref()
+                .map(|r| r.started.elapsed())
+                .unwrap_or_default();
+            let err = self
+                .stream
+                .as_ref()
+                .map(|r| lock(&r.last_err).clone())
+                .unwrap_or_default();
             self.log.log(format!("[stream] disconnected: {err}"));
             if let Some(r) = self.stream.take()
-                && let Some(h) = r.begin_stop(self.log.clone()) {
-                    self.stoppers.push(h);
-                }
-            let attempts = if ok_for > Duration::from_secs(60) { 0 } else { self.stream_retry.map(|r| r.1).unwrap_or(0) };
+                && let Some(h) = r.begin_stop(self.log.clone())
+            {
+                self.stoppers.push(h);
+            }
+            let attempts = if ok_for > Duration::from_secs(60) {
+                0
+            } else {
+                self.stream_retry.map(|r| r.1).unwrap_or(0)
+            };
             if self.stream_user_on && attempts < STREAM_MAX_RETRIES {
                 let wait = Duration::from_secs(2u64 << attempts.min(5));
-                self.log.log(format!("[stream] reconnecting in {}s (attempt {}/{STREAM_MAX_RETRIES})", wait.as_secs(), attempts + 1));
+                self.log.log(format!(
+                    "[stream] reconnecting in {}s (attempt {}/{STREAM_MAX_RETRIES})",
+                    wait.as_secs(),
+                    attempts + 1
+                ));
                 self.stream_retry = Some((Instant::now() + wait, attempts + 1));
             } else {
                 if self.stream_user_on {
@@ -2848,48 +3556,63 @@ impl AppState {
             self.update_buttons();
         }
         if let Some((at, n)) = self.stream_retry
-            && Instant::now() >= at {
-                match self.start_stream() {
-                    Ok(()) => self.stream_retry = Some((Instant::now() + Duration::from_secs(3600 * 24 * 365), n)),
-                    Err(e) => {
-                        self.log.log(format!("[stream] reconnect failed: {e}"));
-                        self.stream_retry = None;
-                        self.stream_user_on = false;
-                    }
+            && Instant::now() >= at
+        {
+            match self.start_stream() {
+                Ok(()) => {
+                    self.stream_retry =
+                        Some((Instant::now() + Duration::from_secs(3600 * 24 * 365), n))
                 }
-                self.update_buttons();
+                Err(e) => {
+                    self.log.log(format!("[stream] reconnect failed: {e}"));
+                    self.stream_retry = None;
+                    self.stream_user_on = false;
+                }
             }
+            self.update_buttons();
+        }
         // While connected, the retry slot only carries the attempt counter.
         if self.stream.is_some()
-            && let Some((_, n)) = self.stream_retry {
-                if self.stream.as_ref().map(|s| s.started.elapsed() > Duration::from_secs(60)).unwrap_or(false) {
-                    self.stream_retry = None;
-                } else {
-                    self.stream_retry = Some((Instant::now() + Duration::from_secs(3600 * 24 * 365), n));
-                }
+            && let Some((_, n)) = self.stream_retry
+        {
+            if self
+                .stream
+                .as_ref()
+                .map(|s| s.started.elapsed() > Duration::from_secs(60))
+                .unwrap_or(false)
+            {
+                self.stream_retry = None;
+            } else {
+                self.stream_retry =
+                    Some((Instant::now() + Duration::from_secs(3600 * 24 * 365), n));
             }
+        }
 
         // Headless/scheduled recording (--record N).
         if let Some((start_at, dur)) = self.auto_record
-            && Instant::now() >= start_at && self.rec.is_none() && self.auto_record_stop.is_none() {
-                match self.start_record() {
-                    Ok(()) => self.auto_record_stop = Some(Instant::now() + dur),
-                    Err(e) => {
-                        self.log.log(format!("auto-record failed: {e}"));
-                        eprintln!("auto-record failed: {e}");
-                        self.auto_record = None;
-                        self.quit = true;
-                    }
+            && Instant::now() >= start_at
+            && self.rec.is_none()
+            && self.auto_record_stop.is_none()
+        {
+            match self.start_record() {
+                Ok(()) => self.auto_record_stop = Some(Instant::now() + dur),
+                Err(e) => {
+                    self.log.log(format!("auto-record failed: {e}"));
+                    eprintln!("auto-record failed: {e}");
+                    self.auto_record = None;
+                    self.quit = true;
                 }
-                self.update_buttons();
             }
+            self.update_buttons();
+        }
         if let Some(t) = self.auto_record_stop
-            && (Instant::now() >= t || self.rec.is_none()) {
-                self.stop_record();
-                self.auto_record = None;
-                self.auto_record_stop = None;
-                self.quit = true;
-            }
+            && (Instant::now() >= t || self.rec.is_none())
+        {
+            self.stop_record();
+            self.auto_record = None;
+            self.auto_record_stop = None;
+            self.quit = true;
+        }
 
         // Reap finished background stoppers.
         let mut i = 0;
@@ -2928,7 +3651,10 @@ impl AppState {
         if let Some(r) = &self.stream {
             parts.push(format!("● LIVE {}", fmt_dur(r.started.elapsed())));
         } else if let Some((at, n)) = self.stream_retry {
-            parts.push(format!("LIVE reconnecting in {}s ({n}/{STREAM_MAX_RETRIES})", at.saturating_duration_since(Instant::now()).as_secs()));
+            parts.push(format!(
+                "LIVE reconnecting in {}s ({n}/{STREAM_MAX_RETRIES})",
+                at.saturating_duration_since(Instant::now()).as_secs()
+            ));
         }
         if let Some(c) = &self.comp {
             parts.push(format!(
@@ -2937,25 +3663,36 @@ impl AppState {
                 c.sh.ch,
                 c.sh.fps_milli.load(Relaxed) as f64 / 1000.0
             ));
-            parts.push(format!("compose {:.1} ms", c.sh.compose_us.load(Relaxed) as f64 / 1000.0));
+            parts.push(format!(
+                "compose {:.1} ms",
+                c.sh.compose_us.load(Relaxed) as f64 / 1000.0
+            ));
             parts.push(format!("lagged {}", c.sh.late.load(Relaxed)));
         }
         parts.push(format!("scene: {}", self.scene().name));
         if !self.ff.ok {
             parts.push("ffmpeg NOT FOUND — see Settings".into());
         }
-        self.ui.status.set_label(&label_escape(&format!("  {}", parts.join("   |   "))));
+        self.ui
+            .status
+            .set_label(&label_escape(&format!("  {}", parts.join("   |   "))));
 
         // Selected source status.
         let st = self.sel_index().map(|i| {
             let s = &self.scene().sources[i];
-            let rt = self.runtimes.get(&source_sig(s, self.prof.settings.fps, &self.prof.settings.ffmpeg_path));
+            let rt = self.runtimes.get(&source_sig(
+                s,
+                self.prof.settings.fps,
+                &self.prof.settings.ffmpeg_path,
+            ));
             match rt {
                 Some(rt) => format!("{}: {}", s.name, lock(&rt.status)),
                 None => format!("{}: hidden", s.name),
             }
         });
-        self.ui.src_status.set_label(&label_escape(&truncate_chars(&st.unwrap_or_default(), 160)));
+        self.ui
+            .src_status
+            .set_label(&label_escape(&truncate_chars(&st.unwrap_or_default(), 160)));
 
         if self.dirty && self.last_save.elapsed() > Duration::from_secs(15) {
             self.save();
@@ -2968,7 +3705,12 @@ impl AppState {
             Msg::Tick => self.tick(),
             Msg::Quit => {
                 if self.outputs_active() {
-                    let c = dialog::choice2_default("Recording or streaming is active.\nStop and quit?", "Cancel", "Stop && Quit", "");
+                    let c = dialog::choice2_default(
+                        "Recording or streaming is active.\nStop and quit?",
+                        "Cancel",
+                        "Stop && Quit",
+                        "",
+                    );
                     if c != Some(1) {
                         return;
                     }
@@ -2977,7 +3719,10 @@ impl AppState {
             }
             Msg::SceneSelect => {
                 let v = self.ui.scenes.value();
-                if v >= 1 && (v as usize) <= self.prof.scenes.len() && v as usize - 1 != self.prof.current {
+                if v >= 1
+                    && (v as usize) <= self.prof.scenes.len()
+                    && v as usize - 1 != self.prof.current
+                {
                     self.prof.current = v as usize - 1;
                     self.sel = None;
                     self.apply_scene();
@@ -2993,7 +3738,10 @@ impl AppState {
                 let def = format!("Scene {}", self.prof.scenes.len() + 1);
                 if let Some(n) = dialog::input_default("Scene name:", &def) {
                     let n = truncate_chars(n.trim(), 64);
-                    self.prof.scenes.push(Scene { name: if n.is_empty() { def } else { n }, sources: vec![] });
+                    self.prof.scenes.push(Scene {
+                        name: if n.is_empty() { def } else { n },
+                        sources: vec![],
+                    });
                     self.prof.current = self.prof.scenes.len() - 1;
                     self.sel = None;
                     self.apply_scene();
@@ -3008,7 +3756,9 @@ impl AppState {
                     return;
                 }
                 let nm = self.scene().name.clone();
-                if dialog::choice2_default(&format!("Remove scene '{nm}'?"), "Cancel", "Remove", "") == Some(1) {
+                if dialog::choice2_default(&format!("Remove scene '{nm}'?"), "Cancel", "Remove", "")
+                    == Some(1)
+                {
                     let c = self.prof.current;
                     self.prof.scenes.remove(c);
                     self.prof.current = c.min(self.prof.scenes.len() - 1);
@@ -3032,7 +3782,11 @@ impl AppState {
             }
             Msg::SceneUp | Msg::SceneDown => {
                 let c = self.prof.current;
-                let to = if m == Msg::SceneUp { c.checked_sub(1) } else { Some(c + 1).filter(|&t| t < self.prof.scenes.len()) };
+                let to = if m == Msg::SceneUp {
+                    c.checked_sub(1)
+                } else {
+                    Some(c + 1).filter(|&t| t < self.prof.scenes.len())
+                };
                 if let Some(t) = to {
                     self.prof.scenes.swap(c, t);
                     self.prof.current = t;
@@ -3042,7 +3796,9 @@ impl AppState {
             }
             Msg::SourceSelect => {
                 let line = self.ui.sources.value();
-                self.sel = self.browser_to_index(line).map(|i| self.scene().sources[i].id);
+                self.sel = self
+                    .browser_to_index(line)
+                    .map(|i| self.scene().sources[i].id);
                 self.load_props();
             }
             Msg::SourceAdd => {
@@ -3098,7 +3854,13 @@ impl AppState {
             Msg::SourceRemove => {
                 let Some(i) = self.sel_index() else { return };
                 let nm = self.scene().sources[i].name.clone();
-                if dialog::choice2_default(&format!("Remove source '{nm}'?"), "Cancel", "Remove", "") == Some(1) {
+                if dialog::choice2_default(
+                    &format!("Remove source '{nm}'?"),
+                    "Cancel",
+                    "Remove",
+                    "",
+                ) == Some(1)
+                {
                     if let Some(i) = self.sel_index() {
                         self.scene_mut().sources.remove(i);
                     }
@@ -3120,7 +3882,11 @@ impl AppState {
                 let Some(i) = self.sel_index() else { return };
                 let n = self.scene().sources.len();
                 // "Up" in the list = higher z = larger index.
-                let to = if m == Msg::SourceUp { Some(i + 1).filter(|&t| t < n) } else { i.checked_sub(1) };
+                let to = if m == Msg::SourceUp {
+                    Some(i + 1).filter(|&t| t < n)
+                } else {
+                    i.checked_sub(1)
+                };
                 if let Some(t) = to {
                     self.scene_mut().sources.swap(i, t);
                     self.publish_layers();
@@ -3131,15 +3897,32 @@ impl AppState {
             Msg::PropsApply => {
                 let Some(i) = self.sel_index() else { return };
                 let p = |w: &IntInput| w.value().trim().parse::<i64>().ok();
-                let (x, y, w, h) = (p(&self.ui.px), p(&self.ui.py), p(&self.ui.pw), p(&self.ui.ph));
+                let (x, y, w, h) = (
+                    p(&self.ui.px),
+                    p(&self.ui.py),
+                    p(&self.ui.pw),
+                    p(&self.ui.ph),
+                );
                 let s = &mut self.scene_mut().sources[i];
                 let old = (s.w, s.h);
-                if let Some(x) = x { s.x = x.clamp(-(MAX_W as i64), MAX_W as i64) as i32; }
-                if let Some(y) = y { s.y = y.clamp(-(MAX_H as i64), MAX_H as i64) as i32; }
-                if let Some(w) = w { s.w = w.clamp(MIN_DIM as i64, MAX_W as i64) as u32; }
-                if let Some(h) = h { s.h = h.clamp(MIN_DIM as i64, MAX_H as i64) as u32; }
+                if let Some(x) = x {
+                    s.x = x.clamp(-(MAX_W as i64), MAX_W as i64) as i32;
+                }
+                if let Some(y) = y {
+                    s.y = y.clamp(-(MAX_H as i64), MAX_H as i64) as i32;
+                }
+                if let Some(w) = w {
+                    s.w = w.clamp(MIN_DIM as i64, MAX_W as i64) as u32;
+                }
+                if let Some(h) = h {
+                    s.h = h.clamp(MIN_DIM as i64, MAX_H as i64) as u32;
+                }
                 let resized = old != (s.w, s.h);
-                if resized { self.apply_scene(); } else { self.publish_layers(); }
+                if resized {
+                    self.apply_scene();
+                } else {
+                    self.publish_layers();
+                }
                 self.load_props();
                 self.mark_dirty();
             }
@@ -3172,13 +3955,18 @@ impl AppState {
                         if let SourceKind::Display { w, h, .. } = &s.kind {
                             (s.w, s.h) = ((*w).clamp(MIN_DIM, MAX_W), (*h).clamp(MIN_DIM, MAX_H));
                         } else if let SourceKind::Webcam { size, .. } = &s.kind
-                            && let Some((w, h)) = parse_size(size) {
-                                (s.w, s.h) = (w.max(MIN_DIM), h.max(MIN_DIM));
-                            }
+                            && let Some((w, h)) = parse_size(size)
+                        {
+                            (s.w, s.h) = (w.max(MIN_DIM), h.max(MIN_DIM));
+                        }
                     }
                 }
                 let resized = old != (s.w, s.h);
-                if resized { self.apply_scene(); } else { self.publish_layers(); }
+                if resized {
+                    self.apply_scene();
+                } else {
+                    self.publish_layers();
+                }
                 self.load_props();
                 self.mark_dirty();
             }
@@ -3208,10 +3996,17 @@ impl AppState {
             Msg::Screenshot => self.screenshot(),
             Msg::Settings => {
                 let cur = self.prof.settings.clone();
-                let Some(ns) = settings_dialog(&cur, &self.ff) else { return };
-                let needs_restart = ns.canvas_w != cur.canvas_w || ns.canvas_h != cur.canvas_h || ns.fps != cur.fps || ns.ffmpeg_path != cur.ffmpeg_path;
+                let Some(ns) = settings_dialog(&cur, &self.ff) else {
+                    return;
+                };
+                let needs_restart = ns.canvas_w != cur.canvas_w
+                    || ns.canvas_h != cur.canvas_h
+                    || ns.fps != cur.fps
+                    || ns.ffmpeg_path != cur.ffmpeg_path;
                 if needs_restart && self.outputs_active() {
-                    dialog::alert_default("Stop recording/streaming before changing canvas size, FPS or the ffmpeg path.");
+                    dialog::alert_default(
+                        "Stop recording/streaming before changing canvas size, FPS or the ffmpeg path.",
+                    );
                     return;
                 }
                 self.prof.settings = ns;
@@ -3224,17 +4019,25 @@ impl AppState {
                     self.stop_pipeline();
                     self.start_pipeline();
                 }
-                if self.ff.ok && !self.ff.encoders.is_empty() && !self.ff.encoders.contains(&self.prof.settings.encoder) {
-                    self.log.log(format!("warning: encoder {} not available in this ffmpeg build", self.prof.settings.encoder));
+                if self.ff.ok
+                    && !self.ff.encoders.is_empty()
+                    && !self.ff.encoders.contains(&self.prof.settings.encoder)
+                {
+                    self.log.log(format!(
+                        "warning: encoder {} not available in this ffmpeg build",
+                        self.prof.settings.encoder
+                    ));
                 }
                 self.save();
             }
             Msg::SaveProfile => {
                 self.save();
-                self.log.log(format!("profile saved: {}", self.profile_path.display()));
+                self.log
+                    .log(format!("profile saved: {}", self.profile_path.display()));
             }
             Msg::SaveProfileAs => {
-                let mut fc = dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseSaveFile);
+                let mut fc =
+                    dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseSaveFile);
                 fc.set_filter("LiteCast profile\t*.json");
                 fc.set_option(dialog::NativeFileChooserOptions::SaveAsConfirm);
                 fc.show();
@@ -3249,7 +4052,8 @@ impl AppState {
                     Ok(()) => {
                         self.profile_path = f;
                         self.dirty = false;
-                        self.log.log(format!("profile saved: {}", self.profile_path.display()));
+                        self.log
+                            .log(format!("profile saved: {}", self.profile_path.display()));
                     }
                     Err(e) => dialog::alert_default(&format!("Save failed: {e}")),
                 }
@@ -3259,7 +4063,8 @@ impl AppState {
                     dialog::alert_default("Stop recording/streaming before loading a profile.");
                     return;
                 }
-                let mut fc = dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseFile);
+                let mut fc =
+                    dialog::NativeFileChooser::new(dialog::NativeFileChooserType::BrowseFile);
                 fc.set_filter("LiteCast profile\t*.json");
                 fc.show();
                 let f = fc.filename();
@@ -3284,27 +4089,51 @@ impl AppState {
                         self.start_pipeline();
                         self.refresh_scenes();
                         self.refresh_sources();
-                        self.log.log(format!("profile loaded: {}", self.profile_path.display()));
+                        self.log
+                            .log(format!("profile loaded: {}", self.profile_path.display()));
                     }
                     Err(e) => dialog::alert_default(&format!("Load failed: {e}")),
                 }
             }
             Msg::About => dialog::message_default(&format!(
                 "{APP_NAME} v{APP_VERSION}\nLightweight OBS-style recorder & streamer\nRust + FLTK, encoding via ffmpeg.\n\n{}\nProfile: {}",
-                if self.ff.ok { self.ff.version.as_str() } else { "ffmpeg not found" },
+                if self.ff.ok {
+                    self.ff.version.as_str()
+                } else {
+                    "ffmpeg not found"
+                },
                 self.profile_path.display()
             )),
             Msg::PreviewPush(mx, my, shift) => {
-                let Some((cx, cy)) = self.canvas_xy(mx, my) else { return };
-                let hit = self.scene().sources.iter().rev().find(|s| {
-                    s.visible && cx >= s.x && cy >= s.y && (cx as i64) < s.x as i64 + s.w as i64 && (cy as i64) < s.y as i64 + s.h as i64
-                }).map(|s| (s.id, s.x, s.y, s.w, s.h));
+                let Some((cx, cy)) = self.canvas_xy(mx, my) else {
+                    return;
+                };
+                let hit = self
+                    .scene()
+                    .sources
+                    .iter()
+                    .rev()
+                    .find(|s| {
+                        s.visible
+                            && cx >= s.x
+                            && cy >= s.y
+                            && (cx as i64) < s.x as i64 + s.w as i64
+                            && (cy as i64) < s.y as i64 + s.h as i64
+                    })
+                    .map(|s| (s.id, s.x, s.y, s.w, s.h));
                 match hit {
                     Some((id, x, y, w, h)) => {
                         self.sel = Some(id);
                         // Grabbing the bottom-right handle also resizes.
-                        let near_corner = (cx - (x + w as i32)).abs() < 24 && (cy - (y + h as i32)).abs() < 24;
-                        self.drag = Some(DragState { id, start: (cx, cy), orig: (x, y, w, h), resize: shift || near_corner, moved: false });
+                        let near_corner =
+                            (cx - (x + w as i32)).abs() < 24 && (cy - (y + h as i32)).abs() < 24;
+                        self.drag = Some(DragState {
+                            id,
+                            start: (cx, cy),
+                            orig: (x, y, w, h),
+                            resize: shift || near_corner,
+                            moved: false,
+                        });
                     }
                     None => {
                         self.sel = None;
@@ -3314,12 +4143,16 @@ impl AppState {
                 self.refresh_sources();
             }
             Msg::PreviewDrag(mx, my) => {
-                let Some((cx, cy)) = self.canvas_xy(mx, my) else { return };
+                let Some((cx, cy)) = self.canvas_xy(mx, my) else {
+                    return;
+                };
                 let Some(d) = &mut self.drag else { return };
                 let (dx, dy) = (cx - d.start.0, cy - d.start.1);
                 d.moved = true;
                 let (id, orig, resize) = (d.id, d.orig, d.resize);
-                let Some(s) = self.scene_mut().sources.iter_mut().find(|s| s.id == id) else { return };
+                let Some(s) = self.scene_mut().sources.iter_mut().find(|s| s.id == id) else {
+                    return;
+                };
                 if resize {
                     s.w = (orig.2 as i64 + dx as i64).clamp(MIN_DIM as i64, MAX_W as i64) as u32;
                     s.h = (orig.3 as i64 + dy as i64).clamp(MIN_DIM as i64, MAX_H as i64) as u32;
@@ -3336,25 +4169,33 @@ impl AppState {
             }
             Msg::PreviewRelease => {
                 if let Some(d) = self.drag.take()
-                    && d.moved {
-                        if d.resize {
-                            // Commit the new size: apply_scene restarts only this source.
-                            self.apply_scene();
-                        } else {
-                            self.publish_layers();
-                        }
-                        self.load_props();
-                        self.mark_dirty();
+                    && d.moved
+                {
+                    if d.resize {
+                        // Commit the new size: apply_scene restarts only this source.
+                        self.apply_scene();
+                    } else {
+                        self.publish_layers();
                     }
+                    self.load_props();
+                    self.mark_dirty();
+                }
             }
         }
     }
 
     fn log_ff(&self) {
         if self.ff.ok {
-            self.log.log(format!("{} (fps_mode: {})", self.ff.version, self.ff.has_fps_mode()));
+            self.log.log(format!(
+                "{} (fps_mode: {})",
+                self.ff.version,
+                self.ff.has_fps_mode()
+            ));
         } else {
-            self.log.log(format!("ffmpeg not found at '{}' — set it in Settings", self.prof.settings.ffmpeg_path));
+            self.log.log(format!(
+                "ffmpeg not found at '{}' — set it in Settings",
+                self.prof.settings.ffmpeg_path
+            ));
         }
     }
 
@@ -3405,7 +4246,11 @@ fn main() {
                     std::process::exit(2);
                 }
             },
-            "--record" => match args.next().and_then(|v| v.parse::<u64>().ok()).filter(|v| (1..=86_400 * 7).contains(v)) {
+            "--record" => match args
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|v| (1..=86_400 * 7).contains(v))
+            {
                 Some(s) => auto_rec = Some(Duration::from_secs(s)),
                 None => {
                     eprint!("--record needs seconds (1..604800)\n\n{}", usage());
@@ -3440,7 +4285,11 @@ fn main() {
     log.set_secrets(secrets_of(&prof.settings));
 
     let q = Q(Rc::new(RefCell::new(VecDeque::new())));
-    let pv = Arc::new(PreviewShared { buf: Mutex::new((vec![], 0, 0)), seq: AtomicU64::new(0), req: AtomicU64::new(0) });
+    let pv = Arc::new(PreviewShared {
+        buf: Mutex::new((vec![], 0, 0)),
+        seq: AtomicU64::new(0),
+        req: AtomicU64::new(0),
+    });
     let ov = Arc::new(Mutex::new(Overlay::default()));
     let mut ui = build_ui(&q, pv.clone(), ov.clone());
     ui.win.show();
@@ -3524,7 +4373,15 @@ mod tests {
     use super::*;
 
     fn layer(x: i32, y: i32, w: u32, h: u32, op: u8) -> Layer {
-        Layer { x, y, w, h, opacity: op, slot: Arc::new(Mutex::new(None)), opaque: Arc::new(AtomicBool::new(true)) }
+        Layer {
+            x,
+            y,
+            w,
+            h,
+            opacity: op,
+            slot: Arc::new(Mutex::new(None)),
+            opaque: Arc::new(AtomicBool::new(true)),
+        }
     }
 
     #[test]
@@ -3536,13 +4393,16 @@ mod tests {
             blit(&mut dst, cw, ch, &src, &layer(x, y, 3, 3, 255), true);
         }
         assert_eq!(&dst[0..4], &[10, 20, 30, 255]); // (-2,-2) covers (0,0)
-        assert_eq!(&dst[(3 * cw + 3) * 4..(3 * cw + 3) * 4 + 4], &[10, 20, 30, 255]);
+        assert_eq!(
+            &dst[(3 * cw + 3) * 4..(3 * cw + 3) * 4 + 4],
+            &[10, 20, 30, 255]
+        );
     }
 
     #[test]
     fn blit_half_opacity() {
-        let mut dst = [0u8, 0, 0, 255].repeat(1);
-        let src = [200u8, 100, 50, 255].repeat(1);
+        let mut dst = vec![0u8, 0, 0, 255];
+        let src = vec![200u8, 100, 50, 255];
         blit(&mut dst, 1, 1, &src, &layer(0, 0, 1, 1, 128), true);
         assert_eq!(dst, vec![100, 50, 25, 255]);
     }
@@ -3584,10 +4444,15 @@ mod tests {
 
     #[test]
     fn stream_target_and_redaction() {
-        let mut s = Settings::default();
-        s.stream_url = "rtmp://example.com/app/".into();
-        s.stream_key = "live_abc123".into();
-        assert_eq!(stream_target(&s).unwrap(), "rtmp://example.com/app/live_abc123");
+        let mut s = Settings {
+            stream_url: "rtmp://example.com/app/".into(),
+            stream_key: "live_abc123".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            stream_target(&s).unwrap(),
+            "rtmp://example.com/app/live_abc123"
+        );
         s.stream_url = "http://x".into();
         assert!(stream_target(&s).is_err());
         s.stream_url = "rtmp://u:p@h/app".into();
@@ -3601,9 +4466,16 @@ mod tests {
 
     #[test]
     fn encoder_args_shape() {
-        let mut s = Settings::default();
-        s.audio_api = "pulse".into();
-        let ff = FfInfo { ok: true, major: 6, minor: 1, ..Default::default() };
+        let mut s = Settings {
+            audio_api: "pulse".into(),
+            ..Default::default()
+        };
+        let ff = FfInfo {
+            ok: true,
+            major: 6,
+            minor: 1,
+            ..Default::default()
+        };
         let a = encoder_args(&s, &ff, OutKind::Record, "/tmp/x.mkv");
         let j = a.join(" ");
         assert!(j.contains("-f rawvideo -pix_fmt bgra"));
@@ -3612,7 +4484,12 @@ mod tests {
         assert!(j.contains("-fps_mode cfr"));
         assert!(a.last().unwrap() == "file:/tmp/x.mkv");
         s.audio_api = "none".into();
-        let a = encoder_args(&s, &FfInfo { major: 4, ..ff }, OutKind::Stream, "rtmp://h/a/k");
+        let a = encoder_args(
+            &s,
+            &FfInfo { major: 4, ..ff },
+            OutKind::Stream,
+            "rtmp://h/a/k",
+        );
         let j = a.join(" ");
         assert!(!j.contains("-c:a") && j.contains("-vsync cfr") && j.contains("-f flv"));
     }
