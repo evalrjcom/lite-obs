@@ -93,6 +93,38 @@ jobs:
           echo "recorded $f with $n frames"
           [ "$n" -ge 60 ] || { echo "::error::smoke recording too short ($n frames)"; exit 1; }
 
+      - name: Multistream smoke test (--stream, tee + fifo)
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/ms"; mkdir -p "$T"
+          # Two local RTMP "platforms"; each exits when the publisher disconnects.
+          for i in 1 2; do
+            ffmpeg -hide_banner -loglevel error -y -listen 1 -timeout 90 \
+              -i "rtmp://127.0.0.1:1936$i/live/key$i" -c copy "$T/out$i.flv" &
+          done
+          sleep 1
+          cat > "$T/profile.json" <<JSON
+          {"format":1,
+           "settings":{"canvas_w":640,"canvas_h":360,"fps":30,"audio_api":"none","keyint_sec":2,
+                       "destinations":[
+                         {"name":"A","service":"custom","url":"rtmp://127.0.0.1:19361/live","key":"key1","enabled":true},
+                         {"name":"B","service":"custom","url":"rtmp://127.0.0.1:19362/live","key":"key2","enabled":true},
+                         {"name":"Off","service":"custom","url":"rtmp://127.0.0.1:19363/live","key":"key3","enabled":false}]},
+           "scenes":[{"name":"MS","sources":[
+             {"id":1,"name":"Tint","kind":{"type":"color","r":200,"g":40,"b":40},
+              "visible":true,"x":0,"y":0,"w":640,"h":360,"opacity":255}]}],
+           "current":0}
+          JSON
+          timeout 90 xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./target/release/litecast --profile "$T/profile.json" --stream 6
+          wait   # listeners finish writing
+          for i in 1 2; do
+            v=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of csv=p=0 "$T/out$i.flv")
+            a=$(ffprobe -v error -count_packets -select_streams a:0 -show_entries stream=nb_read_packets -of csv=p=0 "$T/out$i.flv")
+            echo "destination $i: video=$v audio=$a packets"
+            [ "${v:-0}" -ge 90 ] && [ "${a:-0}" -ge 100 ] || { echo "::error::destination $i incomplete"; exit 1; }
+          done
+
       - name: Package
         run: |
           set -euo pipefail

@@ -1,5 +1,5 @@
 // =============================================================================
-//  litecast_v1.0.0 — LiteCast Studio
+//  litecast_v1.1.0 — LiteCast Studio
 //  A lightweight OBS-style recorder / live streamer in Rust + FLTK.
 //
 //  Architecture (one process, ffmpeg used as an external worker binary):
@@ -22,6 +22,12 @@
 //  Runtime: ffmpeg >= 4.4 on PATH (or set in Settings).
 //
 //  Changelog
+//   1.1.0  Kick + Rumble (+ Twitch/YouTube/custom) stream destinations with
+//          presets; multistream to all enabled destinations from ONE encode
+//          (tee + fifo) with per-destination auto-reconnect; silent audio
+//          track when no audio device is set; x264 CBR (nal-hrd) for live;
+//          RTMPS capability check; pre-flight bitrate/keyframe warnings;
+//          v1.0 single URL/key profiles migrate automatically.
 //   1.0.0  Initial release: scenes, display/webcam/media/image/color sources,
 //          z-order, opacity, drag-move / shift-drag-resize in preview,
 //          recording (mkv/mp4/mov/flv/ts), RTMP/RTMPS/SRT streaming with
@@ -203,7 +209,12 @@ struct Settings {
     keyint_sec: u32,
     rec_dir: String,
     rec_format: String,
+    /// v1.1: multistream destinations (Kick, Rumble, Twitch, YouTube, custom).
+    destinations: Vec<Destination>,
+    /// v1.0 single-destination fields: read for migration, never written back.
+    #[serde(skip_serializing)]
     stream_url: String,
+    #[serde(skip_serializing)]
     stream_key: String,
     audio_api: String,
     mic_device: String,
@@ -241,7 +252,8 @@ impl Default for Settings {
             keyint_sec: 2,
             rec_dir: rec_dir.to_string_lossy().into_owned(),
             rec_format: "mkv".into(),
-            stream_url: "rtmp://live.twitch.tv/app".into(),
+            destinations: vec![],
+            stream_url: String::new(),
             stream_key: String::new(),
             audio_api: api.into(),
             mic_device: mic.into(),
@@ -443,6 +455,31 @@ fn sanitize(p: &mut Profile) {
     ] {
         *f = truncate_chars(&f.replace('\0', ""), 1024);
     }
+    // v1.0 -> v1.1: the single URL/key pair becomes a destination.
+    if s.destinations.is_empty() && !s.stream_key.trim().is_empty() {
+        let svc = guess_service(&s.stream_url);
+        s.destinations.push(Destination {
+            name: service_info(svc).label.into(),
+            service: svc.into(),
+            url: s.stream_url.trim().into(),
+            key: s.stream_key.trim().into(),
+            enabled: true,
+        });
+    }
+    s.stream_url.clear();
+    s.stream_key.clear();
+    s.destinations.truncate(MAX_DESTINATIONS);
+    for d in &mut s.destinations {
+        if !SERVICES.iter().any(|x| x.id == d.service) {
+            d.service = "custom".into();
+        }
+        d.name = truncate_chars(d.name.replace('\0', "").trim(), 48);
+        if d.name.is_empty() {
+            d.name = service_info(&d.service).label.into();
+        }
+        d.url = truncate_chars(d.url.replace('\0', "").trim(), 1024);
+        d.key = truncate_chars(d.key.replace('\0', "").trim(), 512);
+    }
     p.scenes.truncate(MAX_SCENES);
     if p.scenes.is_empty() {
         p.scenes.push(Scene {
@@ -604,6 +641,7 @@ struct FfInfo {
     minor: u32,
     version: String,
     encoders: HashSet<String>,
+    out_protocols: HashSet<String>,
 }
 impl FfInfo {
     fn has_fps_mode(&self) -> bool {
@@ -708,6 +746,21 @@ fn detect_ffmpeg(prog: &str) -> FfInfo {
             None => (99, 0),
         };
         fi.ok = true;
+    }
+    if fi.ok
+        && let Ok((o, _, _)) = run_tool(
+            prog,
+            &a(&["-hide_banner", "-protocols"]),
+            None,
+            128 * 1024,
+            Duration::from_secs(5),
+            None,
+        )
+    {
+        let txt = String::from_utf8_lossy(&o);
+        if let Some((_, outs)) = txt.split_once("Output:") {
+            fi.out_protocols = outs.split_whitespace().map(str::to_string).collect();
+        }
     }
     if fi.ok
         && let Ok((o, _, _)) = run_tool(
@@ -911,11 +964,27 @@ fn detect_audio_devices(api: &str, ff: &str) -> DevList {
 
 /// Bounded line reader for child stderr. Drains continuously so a chatty
 /// ffmpeg can never fill the pipe and deadlock.
+type LineHook = Box<dyn Fn(&str) + Send>;
+/// (name, ingest URL, last error time) per stream destination.
+type DestHealth = Arc<Mutex<Vec<(String, String, Option<Instant>)>>>;
+
 fn spawn_stderr_drain(
     err: ChildStderr,
     tag: String,
     log: Logger,
     last: Arc<Mutex<String>>,
+) -> Option<JoinHandle<()>> {
+    spawn_stderr_drain_hook(err, tag, log, last, None)
+}
+
+/// Same, with an optional per-line hook (sees the raw line before redaction;
+/// used to track per-destination stream health).
+fn spawn_stderr_drain_hook(
+    err: ChildStderr,
+    tag: String,
+    log: Logger,
+    last: Arc<Mutex<String>>,
+    hook: Option<LineHook>,
 ) -> Option<JoinHandle<()>> {
     thread::Builder::new()
         .name(format!("stderr-{tag}"))
@@ -931,6 +1000,9 @@ fn spawn_stderr_drain(
                         let s = s.trim();
                         if s.is_empty() {
                             continue;
+                        }
+                        if let Some(h) = &hook {
+                            h(s);
                         }
                         *lock(&last) = truncate_chars(s, 300);
                         log.log(format!("[{tag}] {s}"));
@@ -1592,6 +1664,226 @@ fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
 }
 
 // ----------------------------------------------------------------------------
+// Streaming services & multistream destinations (v1.1.0)
+// ----------------------------------------------------------------------------
+const MAX_DESTINATIONS: usize = 8;
+
+/// fifo pseudo-muxer options for every stream slave: each destination
+/// reconnects on its own (OBS-like: 2 s delay, 25 tries) without restarting
+/// the encoder or disturbing the other destinations.
+const FIFO_OPTS: &str = "attempt_recovery=1:recover_any_error=1:recovery_wait_time=2:\
+max_recovery_attempts=25:drop_pkts_on_overflow=1:restart_with_keyframe=1:queue_size=600";
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+struct Destination {
+    name: String,
+    service: String,
+    url: String,
+    key: String,
+    enabled: bool,
+}
+
+struct ServiceInfo {
+    id: &'static str,
+    label: &'static str,
+    url: &'static str,
+    /// Ingest limits used for pre-flight warnings (0 = not checked).
+    max_kbps: u32,
+    keyint_sec: u32,
+    tls_only: bool,
+    key_required: bool,
+    hint: &'static str,
+}
+
+const SERVICES: &[ServiceInfo] = &[
+    ServiceInfo {
+        id: "kick",
+        label: "Kick",
+        url: "rtmps://fa723fc1b171.global-contribute.live-video.net/app",
+        max_kbps: 8000,
+        keyint_sec: 2,
+        tls_only: true,
+        key_required: true,
+        hint: "Kick: Creator Dashboard → Channel → Stream URL and Key. Paste BOTH values \
+(your server URL may differ from the default). RTMPS only; CBR, 2 s keyframes, \
+1000–8000 kbps.",
+    },
+    ServiceInfo {
+        id: "rumble",
+        label: "Rumble",
+        url: "rtmp://rtmp.rumble.com/live",
+        max_kbps: 0,
+        keyint_sec: 0,
+        tls_only: false,
+        key_required: true,
+        hint: "Rumble: Go Live → create the stream → Get Streamer Configuration. Paste the \
+Stream URL and Stream Key shown there. Keys are per-event unless you enable a static key.",
+    },
+    ServiceInfo {
+        id: "twitch",
+        label: "Twitch",
+        url: "rtmp://live.twitch.tv/app",
+        max_kbps: 0,
+        keyint_sec: 2,
+        tls_only: false,
+        key_required: true,
+        hint: "Twitch: Creator Dashboard → Settings → Stream → Primary Stream key.",
+    },
+    ServiceInfo {
+        id: "youtube",
+        label: "YouTube",
+        url: "rtmp://a.rtmp.youtube.com/live2",
+        max_kbps: 0,
+        keyint_sec: 0,
+        tls_only: false,
+        key_required: true,
+        hint: "YouTube: Studio → Go Live → Stream → Stream key.",
+    },
+    ServiceInfo {
+        id: "custom",
+        label: "Custom",
+        url: "",
+        max_kbps: 0,
+        keyint_sec: 0,
+        tls_only: false,
+        key_required: false,
+        hint: "Any RTMP / RTMPS / SRT ingest. The key is appended to the URL \
+(ignored for srt:// — put streamid/passphrase in the URL instead).",
+    },
+];
+
+fn service_info(id: &str) -> &'static ServiceInfo {
+    SERVICES
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap_or(&SERVICES[SERVICES.len() - 1])
+}
+
+fn guess_service(url: &str) -> &'static str {
+    let u = url.to_ascii_lowercase();
+    if u.contains("fa723fc1b171.") || u.contains("kick.com") {
+        "kick"
+    } else if u.contains("rumble.com") {
+        "rumble"
+    } else if u.contains("twitch.tv") {
+        "twitch"
+    } else if u.contains("youtube.com") {
+        "youtube"
+    } else {
+        "custom"
+    }
+}
+
+/// URL/key characters that are safe both as an ffmpeg argument and inside the
+/// tee muxer slave list (where | [ ] \ are syntax). Rejecting beats escaping.
+fn url_chars_ok(s: &str) -> bool {
+    s.chars()
+        .all(|c| c.is_ascii_graphic() && !"|[]\\'\"<>`{}^".contains(c))
+}
+
+/// Validate one destination and build its full ingest URL.
+fn dest_target(d: &Destination) -> Result<String, String> {
+    let svc = service_info(&d.service);
+    let (url, key) = (d.url.trim(), d.key.trim());
+    let lu = url.to_ascii_lowercase();
+    let n = if d.name.is_empty() {
+        svc.label
+    } else {
+        d.name.as_str()
+    };
+    if !["rtmp://", "rtmps://", "srt://"]
+        .iter()
+        .any(|p| lu.starts_with(p))
+    {
+        return Err(format!(
+            "{n}: server URL must start with rtmp://, rtmps:// or srt://"
+        ));
+    }
+    if svc.tls_only && !lu.starts_with("rtmps://") {
+        return Err(format!("{n}: {} only accepts RTMPS (rtmps://…)", svc.label));
+    }
+    if !url_chars_ok(url) {
+        return Err(format!(
+            "{n}: server URL contains characters that are not allowed (spaces, quotes, | [ ] \\ …)"
+        ));
+    }
+    if !key.is_empty() && !url_chars_ok(key) {
+        return Err(format!(
+            "{n}: stream key contains characters that are not allowed"
+        ));
+    }
+    if svc.key_required && key.is_empty() {
+        return Err(format!("{n}: stream key is required"));
+    }
+    Ok(if key.is_empty() || lu.starts_with("srt://") {
+        url.to_string()
+    } else {
+        format!("{}/{}", url.trim_end_matches('/'), key)
+    })
+}
+
+/// Pre-flight for "Start Streaming": hard errors abort, warnings are logged.
+/// Returns ((name, url) per enabled destination, warnings).
+type StreamPlan = (Vec<(String, String)>, Vec<String>);
+fn stream_preflight(s: &Settings, ff: &FfInfo) -> Result<StreamPlan, String> {
+    let enabled: Vec<&Destination> = s.destinations.iter().filter(|d| d.enabled).collect();
+    if enabled.is_empty() {
+        return Err(
+            "No stream destination is enabled.\nAdd one in Controls → Stream Destinations (Ctrl+D)."
+                .into(),
+        );
+    }
+    let mut targets = vec![];
+    let mut warns = vec![];
+    for d in enabled {
+        let url = dest_target(d)?;
+        let svc = service_info(&d.service);
+        if url.to_ascii_lowercase().starts_with("rtmps://")
+            && !ff.out_protocols.is_empty()
+            && !ff.out_protocols.contains("rtmps")
+        {
+            return Err(format!(
+                "{}: this ffmpeg build has no RTMPS (TLS) support. Install an ffmpeg built with OpenSSL/GnuTLS.",
+                d.name
+            ));
+        }
+        if svc.max_kbps > 0 && s.video_kbps > svc.max_kbps {
+            warns.push(format!(
+                "{}: video bitrate {} kbps is above {}'s {} kbps ingest limit",
+                d.name, s.video_kbps, svc.label, svc.max_kbps
+            ));
+        }
+        if svc.keyint_sec > 0 && s.keyint_sec != svc.keyint_sec {
+            warns.push(format!(
+                "{}: {} expects a {} s keyframe interval (Settings → Keyint s is {})",
+                d.name, svc.label, svc.keyint_sec, s.keyint_sec
+            ));
+        }
+        targets.push((d.name.clone(), url));
+    }
+    if s.audio_api == "none"
+        || (s.mic_device.trim().is_empty() && s.desktop_device.trim().is_empty())
+    {
+        warns.push("no audio device configured — sending a silent audio track".into());
+    }
+    Ok((targets, warns))
+}
+
+fn dest_summary(v: &[Destination]) -> String {
+    let on: Vec<&str> = v
+        .iter()
+        .filter(|d| d.enabled)
+        .map(|d| d.name.as_str())
+        .collect();
+    match (v.len(), on.len()) {
+        (0, _) => "none — click Edit… to add Kick, Rumble, …".into(),
+        (_, 0) => format!("{} configured, none enabled", v.len()),
+        _ => format!("{} (of {})", on.join(", "), v.len()),
+    }
+}
+
+// ----------------------------------------------------------------------------
 // Output sessions (record / stream) — one ffmpeg encoder each
 // ----------------------------------------------------------------------------
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -1633,7 +1925,8 @@ fn audio_inputs(s: &Settings) -> Vec<Vec<String>> {
 }
 
 /// Pure function: settings -> encoder argv. Kept side-effect free for testing.
-fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<String> {
+/// `targets`: one file path for Record; one or more ingest URLs for Stream.
+fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, targets: &[String]) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut p = |v: &[&str]| a.extend(v.iter().map(|x| x.to_string()));
     p(&[
@@ -1672,7 +1965,21 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<S
     for ai in &auds {
         a.extend(ai.iter().cloned());
     }
+    // Most ingests (Kick/IVS, YouTube) reject or misbehave on video-only
+    // streams: synthesise silence when no audio device is configured.
+    let silent = kind == OutKind::Stream && auds.is_empty();
     let mut p = |v: &[&str]| a.extend(v.iter().map(|x| x.to_string()));
+    if silent {
+        // -re: lavfi sources run as fast as possible otherwise, flooding the
+        // muxer with audio far ahead of the (wallclock-paced) video.
+        p(&[
+            "-re",
+            "-f",
+            "lavfi",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+        ]);
+    }
     let vf = match enc {
         "h264_vaapi" => "format=nv12,hwupload",
         "h264_qsv" => "format=nv12",
@@ -1683,14 +1990,19 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<S
         fc.push_str(";[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]");
     }
     p(&["-filter_complex", &fc, "-map", "[vout]"]);
-    match auds.len() {
-        1 => p(&["-map", "1:a"]),
-        2 => p(&["-map", "[aout]"]),
+    match (auds.len(), silent) {
+        (1, _) | (0, true) => p(&["-map", "1:a"]),
+        (2, _) => p(&["-map", "[aout]"]),
         _ => {}
     }
     p(&["-c:v", enc]);
     match enc {
-        "libx264" => p(&["-preset", &s.x264_preset, "-profile:v", "high"]),
+        "libx264" => {
+            p(&["-preset", &s.x264_preset, "-profile:v", "high"]);
+            if kind == OutKind::Stream {
+                p(&["-x264-params", "nal-hrd=cbr"]); // true CBR: Kick/Twitch requirement
+            }
+        }
         "h264_nvenc" => p(&["-preset", "p4", "-rc", "cbr"]),
         "h264_qsv" => p(&["-preset", "veryfast"]),
         "h264_amf" => p(&["-quality", "speed"]),
@@ -1707,7 +2019,7 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<S
         p(&["-vsync", "cfr"]);
     }
     p(&["-r", &fps]);
-    if !auds.is_empty() {
+    if !auds.is_empty() || silent {
         let ab = format!("{}k", s.audio_kbps);
         p(&["-c:a", "aac", "-b:a", &ab, "-ar", "48000", "-ac", "2"]);
     }
@@ -1720,59 +2032,75 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, target: &str) -> Vec<S
                 "ts" => p(&["-f", "mpegts"]),
                 _ => p(&["-f", "matroska"]),
             }
-            p(&[&file_arg(target)]);
+            let t = targets.first().map(String::as_str).unwrap_or("");
+            p(&[&file_arg(t)]);
         }
         OutKind::Stream => {
-            if target.starts_with("srt://") {
-                p(&["-f", "mpegts", target]);
-            } else {
-                p(&["-f", "flv", "-flvflags", "no_duration_filesize", target]);
-            }
+            // ONE encode fanned out by tee; each slave sits behind a fifo so a
+            // slow/dead destination neither blocks nor kills the others and
+            // reconnects on its own. FLV/TS slaves need codec extradata up
+            // front when muxed through tee, hence global_header.
+            let slaves = targets
+                .iter()
+                .map(|t| {
+                    if t.to_ascii_lowercase().starts_with("srt://") {
+                        format!("[f=mpegts:onfail=ignore]{t}")
+                    } else {
+                        format!("[f=flv:flvflags=no_duration_filesize:onfail=ignore]{t}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            p(&[
+                "-flags:v",
+                "+global_header",
+                "-flags:a",
+                "+global_header",
+                "-f",
+                "tee",
+                "-use_fifo",
+                "1",
+                "-fifo_options",
+                FIFO_OPTS,
+                &slaves,
+            ]);
         }
     }
     a
 }
 
-fn stream_target(s: &Settings) -> Result<String, String> {
-    let url = s.stream_url.trim();
-    let ok = ["rtmp://", "rtmps://", "srt://"]
-        .iter()
-        .any(|p| url.to_ascii_lowercase().starts_with(p));
-    if !ok {
-        return Err("Stream URL must start with rtmp://, rtmps:// or srt://".into());
-    }
-    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("Stream URL contains whitespace/control characters".into());
-    }
-    let key = s.stream_key.trim();
-    if key.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("Stream key contains whitespace/control characters".into());
-    }
-    if key.is_empty() || url.starts_with("srt://") {
-        Ok(url.to_string())
-    } else {
-        Ok(format!("{}/{}", url.trim_end_matches('/'), key))
-    }
-}
-
 fn secrets_of(s: &Settings) -> Vec<String> {
-    let mut v = vec![s.stream_key.trim().to_string()];
-    // rtmp://user:pass@host — redact userinfo; srt passphrase in query string.
-    let u = s.stream_url.trim();
-    if let Some(rest) = u.split_once("://").map(|x| x.1)
-        && let Some((ui, _)) = rest.split_once('@')
-    {
-        v.push(ui.to_string());
-    }
-    if let Some((_, q)) = u.split_once('?') {
-        for kv in q.split('&') {
-            if let Some((k, val)) = kv.split_once('=')
-                && (k.eq_ignore_ascii_case("passphrase") || k.eq_ignore_ascii_case("streamid"))
-            {
-                v.push(val.to_string());
+    let mut v = vec![];
+    let pairs = s
+        .destinations
+        .iter()
+        .map(|d| (d.url.as_str(), d.key.as_str()))
+        .chain(std::iter::once((
+            s.stream_url.as_str(),
+            s.stream_key.as_str(),
+        )));
+    for (url, key) in pairs {
+        v.push(key.trim().to_string());
+        // rtmp://user:pass@host — redact userinfo; SRT passphrase/streamid in query.
+        let u = url.trim();
+        if let Some(rest) = u.split_once("://").map(|x| x.1)
+            && let Some((ui, _)) = rest.split_once('@')
+        {
+            v.push(ui.to_string());
+        }
+        if let Some((_, q)) = u.split_once('?') {
+            for kv in q.split('&') {
+                if let Some((k, val)) = kv.split_once('=')
+                    && (k.eq_ignore_ascii_case("passphrase") || k.eq_ignore_ascii_case("streamid"))
+                {
+                    v.push(val.to_string());
+                }
             }
         }
     }
+    v.retain(|x| x.len() >= 4);
+    v.sort();
+    v.dedup();
     v
 }
 
@@ -1787,6 +2115,8 @@ struct OutputSession {
     frames: Arc<AtomicU64>,
     last_err: Arc<Mutex<String>>,
     label: String,
+    /// Stream only: (name, url, last error time) per destination.
+    health: DestHealth,
 }
 
 impl OutputSession {
@@ -1796,10 +2126,11 @@ impl OutputSession {
         ff: &FfInfo,
         comp: &Arc<CompShared>,
         log: &Logger,
-        target: &str,
+        targets: &[(String, String)], // (display name, path or ingest URL)
         label: String,
     ) -> Result<Self, String> {
-        let args = encoder_args(s, ff, kind, target);
+        let urls: Vec<String> = targets.iter().map(|t| t.1.clone()).collect();
+        let args = encoder_args(s, ff, kind, &urls);
         let mut cmd = ffmpeg_cmd(&s.ffmpeg_path);
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -1815,10 +2146,27 @@ impl OutputSession {
             "stream"
         };
         let last_err = Arc::new(Mutex::new(String::new()));
-        let drain = child
-            .stderr
-            .take()
-            .and_then(|e| spawn_stderr_drain(e, tag.into(), log.clone(), last_err.clone()));
+        let health: DestHealth = Arc::new(Mutex::new(
+            targets
+                .iter()
+                .map(|(n, u)| (n.clone(), u.clone(), None))
+                .collect(),
+        ));
+        // Per-destination health: any ffmpeg error line naming a destination's
+        // URL marks it as reconnecting for the next 10 s.
+        let hook: Option<LineHook> = (kind == OutKind::Stream).then(|| {
+            let h = health.clone();
+            Box::new(move |line: &str| {
+                for d in lock(&h).iter_mut() {
+                    if line.contains(d.1.as_str()) {
+                        d.2 = Some(Instant::now());
+                    }
+                }
+            }) as LineHook
+        });
+        let drain = child.stderr.take().and_then(|e| {
+            spawn_stderr_drain_hook(e, tag.into(), log.clone(), last_err.clone(), hook)
+        });
         let sess = Self {
             kind,
             child: Arc::new(Mutex::new(Some(child))),
@@ -1830,6 +2178,7 @@ impl OutputSession {
             frames: Arc::new(AtomicU64::new(0)),
             last_err,
             label,
+            health,
         };
         let (stop, dead, frames, comp2, log2) = (
             sess.stop.clone(),
@@ -1847,6 +2196,20 @@ impl OutputSession {
         );
         log.log(format!("[{tag}] started → {}", sess.label));
         Ok(sess)
+    }
+
+    /// "Kick ✓, Rumble ⟳" — ⟳ = error seen in the last 10 s (fifo reconnecting).
+    fn health_summary(&self) -> String {
+        lock(&self.health)
+            .iter()
+            .map(|(n, _, t)| {
+                let bad = t
+                    .map(|t| t.elapsed() < Duration::from_secs(10))
+                    .unwrap_or(false);
+                format!("{n} {}", if bad { "⟳" } else { "✓" })
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     fn alive(&self) -> bool {
@@ -2066,6 +2429,7 @@ enum Msg {
     ToggleStream,
     Screenshot,
     Settings,
+    Destinations,
     SaveProfile,
     SaveProfileAs,
     LoadProfile,
@@ -2193,6 +2557,12 @@ fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
         "&Controls/S&ettings…",
         Shortcut::Ctrl | ',',
         Msg::Settings,
+    );
+    add(
+        &mut mb,
+        "&Controls/Stream &Destinations…",
+        Shortcut::Ctrl | 'd',
+        Msg::Destinations,
     );
     add(&mut mb, "&Help/&About", Shortcut::None, Msg::About);
     main.fixed(&mb, 26);
@@ -2819,6 +3189,268 @@ fn source_dialog(init: Option<&Source>, st: &Settings) -> Option<(String, Source
     }
 }
 
+fn dest_line(d: &Destination) -> String {
+    let u = d.url.split('?').next().unwrap_or("");
+    format!(
+        "@.{} {}  [{}]  {}",
+        if d.enabled { "●" } else { "○" },
+        d.name,
+        service_info(&d.service).label,
+        truncate_chars(u, 56)
+    )
+}
+
+/// Manage the multistream destination list. Returns the edited list on OK.
+fn destinations_dialog(cur: &[Destination], ff: &FfInfo) -> Option<Vec<Destination>> {
+    let list = Rc::new(RefCell::new(cur.to_vec()));
+    let mut win = Window::default()
+        .with_size(640, 370)
+        .center_screen()
+        .with_label("Stream Destinations");
+    let mut head = Frame::new(
+        15,
+        8,
+        610,
+        40,
+        "Every enabled destination receives the same encode (multistream), and each one \
+reconnects on its own. Double-click a row to edit.",
+    );
+    head.set_align(Align::Left | Align::Inside | Align::Wrap);
+    head.set_label_size(12);
+    let mut br = HoldBrowser::new(15, 52, 490, 262, None);
+    let mut b_add = Button::new(515, 52, 110, 28, "Add…");
+    let mut b_edit = Button::new(515, 86, 110, 28, "Edit…");
+    let mut b_tog = Button::new(515, 120, 110, 28, "Enable/Disable");
+    let mut b_rm = Button::new(515, 154, 110, 28, "Remove");
+    let mut b_up = Button::new(515, 188, 52, 28, "@8>");
+    let mut b_dn = Button::new(573, 188, 52, 28, "@2>");
+    let mut ok = Button::new(435, 326, 90, 30, "OK");
+    let mut cancel = Button::new(535, 326, 90, 30, "Cancel");
+    win.end();
+
+    // Buttons only record an action; the loop below performs it, so no
+    // RefCell borrow is ever held across a nested modal dialog.
+    let act = Rc::new(Cell::new(0u8));
+    let result = Rc::new(Cell::new(0u8));
+    for (b, code) in [
+        (&mut b_add, 1u8),
+        (&mut b_edit, 2),
+        (&mut b_tog, 3),
+        (&mut b_rm, 4),
+        (&mut b_up, 5),
+        (&mut b_dn, 6),
+    ] {
+        let a = act.clone();
+        b.set_callback(move |_| a.set(code));
+    }
+    {
+        let a = act.clone();
+        br.set_callback(move |_| {
+            if app::event_clicks() {
+                a.set(2);
+            }
+        });
+    }
+    for (b, code) in [(&mut ok, 1u8), (&mut cancel, 2)] {
+        let (r, mut w) = (result.clone(), win.clone());
+        b.set_callback(move |_| {
+            r.set(code);
+            w.hide();
+        });
+    }
+    let refresh = |br: &mut HoldBrowser, v: &[Destination], sel: usize| {
+        br.clear();
+        for d in v {
+            br.add(&dest_line(d));
+        }
+        if sel >= 1 && sel <= v.len() {
+            br.select(sel as i32);
+        }
+    };
+    refresh(&mut br, &list.borrow(), 1);
+    win.make_modal(true);
+    win.show();
+    while win.shown() {
+        app::wait();
+        let a = act.replace(0);
+        if a == 0 {
+            continue;
+        }
+        let n = list.borrow().len();
+        let sel = br.value().max(0) as usize; // 1-based, 0 = none
+        let idx = (sel >= 1 && sel <= n).then(|| sel - 1);
+        match (a, idx) {
+            (1, _) => {
+                if n >= MAX_DESTINATIONS {
+                    dialog::alert_default(&format!("At most {MAX_DESTINATIONS} destinations."));
+                } else if let Some(d) = dest_edit_dialog(None, ff) {
+                    list.borrow_mut().push(d);
+                    refresh(&mut br, &list.borrow(), n + 1);
+                }
+            }
+            (2, Some(i)) => {
+                let cur = list.borrow()[i].clone();
+                if let Some(d) = dest_edit_dialog(Some(&cur), ff) {
+                    list.borrow_mut()[i] = d;
+                    refresh(&mut br, &list.borrow(), sel);
+                }
+            }
+            (3, Some(i)) => {
+                {
+                    let mut l = list.borrow_mut();
+                    l[i].enabled = !l[i].enabled;
+                }
+                refresh(&mut br, &list.borrow(), sel);
+            }
+            (4, Some(i)) => {
+                let nm = list.borrow()[i].name.clone();
+                if dialog::choice2_default(
+                    &format!("Remove destination '{nm}'?"),
+                    "Cancel",
+                    "Remove",
+                    "",
+                ) == Some(1)
+                {
+                    list.borrow_mut().remove(i);
+                    refresh(&mut br, &list.borrow(), sel.min(n - 1));
+                }
+            }
+            (5, Some(i)) if i > 0 => {
+                list.borrow_mut().swap(i, i - 1);
+                refresh(&mut br, &list.borrow(), sel - 1);
+            }
+            (6, Some(i)) if i + 1 < n => {
+                list.borrow_mut().swap(i, i + 1);
+                refresh(&mut br, &list.borrow(), sel + 1);
+            }
+            _ => {}
+        }
+    }
+    (result.get() == 1).then(|| list.borrow().clone())
+}
+
+/// Add/Edit one destination with service presets.
+fn dest_edit_dialog(init: Option<&Destination>, ff: &FfInfo) -> Option<Destination> {
+    let mut win = Window::default()
+        .with_size(620, 330)
+        .center_screen()
+        .with_label(if init.is_some() {
+            "Edit Destination"
+        } else {
+            "Add Destination"
+        });
+    let mut svc = Choice::new(130, 15, 200, 26, "Service:");
+    for x in SERVICES {
+        svc.add(
+            &menu_escape(x.label),
+            Shortcut::None,
+            MenuFlag::Normal,
+            |_| {},
+        );
+    }
+    let mut name = Input::new(130, 49, 300, 26, "Name:");
+    let mut url = Input::new(130, 83, 470, 26, "Server URL:");
+    let mut key = SecretInput::new(130, 117, 370, 26, "Stream key:");
+    let mut show = Button::new(510, 117, 90, 26, "Show key");
+    let en = CheckButton::new(130, 151, 200, 26, "Enabled");
+    let mut hint = Frame::new(20, 185, 580, 90, None);
+    hint.set_align(Align::Left | Align::Inside | Align::Wrap | Align::Top);
+    hint.set_label_size(12);
+    let mut ok = Button::new(410, 288, 90, 30, "OK");
+    let mut cancel = Button::new(510, 288, 90, 30, "Cancel");
+    win.end();
+
+    let d0 = init.cloned().unwrap_or_else(|| Destination {
+        name: SERVICES[0].label.into(),
+        service: SERVICES[0].id.into(),
+        url: SERVICES[0].url.into(),
+        key: String::new(),
+        enabled: true,
+    });
+    let si = SERVICES
+        .iter()
+        .position(|x| x.id == d0.service)
+        .unwrap_or(SERVICES.len() - 1);
+    svc.set_value(si as i32);
+    name.set_value(&d0.name);
+    url.set_value(&d0.url);
+    key.set_value(&d0.key);
+    en.set_checked(d0.enabled);
+    {
+        let key = key.clone();
+        show.set_callback(move |_| {
+            // SecretInput can't toggle masking; reveal on demand only.
+            let k = key.value();
+            dialog::message_default(&if k.is_empty() {
+                "(empty)".to_string()
+            } else {
+                k
+            });
+        });
+    }
+    let result = Rc::new(Cell::new(0u8));
+    for (b, code) in [(&mut ok, 1u8), (&mut cancel, 2)] {
+        let (r, mut w) = (result.clone(), win.clone());
+        b.set_callback(move |_| {
+            r.set(code);
+            w.hide();
+        });
+    }
+    let no_tls = ff.ok && !ff.out_protocols.is_empty() && !ff.out_protocols.contains("rtmps");
+    let mut last = -1;
+    loop {
+        win.make_modal(true);
+        win.show();
+        while win.shown() {
+            app::wait();
+            let k = svc.value().clamp(0, SERVICES.len() as i32 - 1);
+            if k != last {
+                let info = &SERVICES[k as usize];
+                if last >= 0 {
+                    // Swap presets only where the user hasn't typed their own value.
+                    let u = url.value();
+                    if u.trim().is_empty()
+                        || SERVICES
+                            .iter()
+                            .any(|x| !x.url.is_empty() && x.url == u.trim())
+                    {
+                        url.set_value(info.url);
+                    }
+                    let n = name.value();
+                    if n.trim().is_empty() || SERVICES.iter().any(|x| x.label == n.trim()) {
+                        name.set_value(info.label);
+                    }
+                }
+                let mut h = info.hint.to_string();
+                if info.tls_only && no_tls {
+                    h.push_str(
+                        "\n⚠ This ffmpeg build lacks RTMPS support — Kick will not work with it.",
+                    );
+                }
+                hint.set_label(&label_escape(&h));
+                last = k;
+            }
+        }
+        if result.get() != 1 {
+            return None;
+        }
+        result.set(0);
+        let info = &SERVICES[svc.value().clamp(0, SERVICES.len() as i32 - 1) as usize];
+        let nm = truncate_chars(name.value().trim(), 48);
+        let d = Destination {
+            name: if nm.is_empty() { info.label.into() } else { nm },
+            service: info.id.into(),
+            url: url.value().trim().to_string(),
+            key: key.value().trim().to_string(),
+            enabled: en.is_checked(),
+        };
+        match dest_target(&d) {
+            Ok(_) => return Some(d),
+            Err(e) => dialog::alert_default(&e),
+        }
+    }
+}
+
 fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
     let mut win = Window::default()
         .with_size(640, 620)
@@ -2857,10 +3489,23 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
     fmt_hint.set_label_size(11);
     fmt_hint.set_align(Align::Left | Align::Inside);
     let r = row(26);
-    let mut url = Input::new(x, r, 430, 26, "Stream URL:");
+    let mut dest_sum = Frame::new(x, r, 330, 26, "Stream destinations:");
+    dest_sum.set_frame(FrameType::DownBox);
+    dest_sum.set_align(Align::Left); // caption outside, like the inputs
+    let mut dest_txt = Frame::new(x + 4, r, 322, 26, None);
+    dest_txt.set_align(Align::Left | Align::Inside | Align::Clip);
+    dest_txt.set_label_size(12);
+    let mut dest_btn = Button::new(x + 340, r, 90, 26, "Edit…");
     let r = row(26);
-    let mut key = SecretInput::new(x, r, 330, 26, "Stream key:");
-    let mut show_key = CheckButton::new(x + 340, r, 90, 26, "Show");
+    let mut dest_hint = Frame::new(
+        x,
+        r,
+        430,
+        26,
+        "Kick, Rumble, Twitch, YouTube or custom — all enabled ones go live together.",
+    );
+    dest_hint.set_label_size(11);
+    dest_hint.set_align(Align::Left | Align::Inside);
     let r = row(26);
     let mut api = Choice::new(x, r, 150, 26, "Audio backend:");
     let mut detect_btn = Button::new(x + 160, r, 130, 26, "Detect devices");
@@ -2924,8 +3569,8 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
             .position(|p| *p == cur.rec_format)
             .unwrap_or(0) as i32,
     );
-    url.set_value(&cur.stream_url);
-    key.set_value(&cur.stream_key);
+    let dests = Rc::new(RefCell::new(cur.destinations.clone()));
+    dest_txt.set_label(&label_escape(&dest_summary(&dests.borrow())));
     api.add_choice(&AUDIO_APIS.join("|"));
     api.set_value(
         AUDIO_APIS
@@ -2940,14 +3585,14 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
 
     let devs: Rc<RefCell<DevList>> = Rc::new(RefCell::new(vec![]));
     {
-        let mut key = key.clone();
-        show_key.set_callback(move |c| {
-            // SecretInput can't toggle masking; show the key in a message box instead.
-            if c.is_checked() {
-                dialog::message_default(&format!("Stream key:\n{}", key.value()));
-                c.set_checked(false);
+        let (dests, ff) = (dests.clone(), ff.clone());
+        let mut dest_txt = dest_txt.clone();
+        dest_btn.set_callback(move |_| {
+            let cur = dests.borrow().clone();
+            if let Some(v) = destinations_dialog(&cur, &ff) {
+                dest_txt.set_label(&label_escape(&dest_summary(&v)));
+                *dests.borrow_mut() = v;
             }
-            key.redraw();
         });
     }
     {
@@ -3065,19 +3710,13 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
             .unwrap_or(&"none")
             .to_string();
         s.rec_dir = recdir.value().trim().to_string();
-        s.stream_url = url.value().trim().to_string();
-        s.stream_key = key.value().trim().to_string();
+        s.destinations = dests.borrow().clone();
         s.mic_device = mic.value().trim().to_string();
         s.desktop_device = desk.value().trim().to_string();
         s.ffmpeg_path = ffp.value().trim().to_string();
         s.vaapi_device = vaapi.value().trim().to_string();
         if s.ffmpeg_path.is_empty() {
             errs.push("ffmpeg binary path is required.".into());
-        }
-        if !s.stream_url.is_empty()
-            && let Err(e) = stream_target(&s)
-        {
-            errs.push(e);
         }
         if errs.is_empty() {
             return Some(s);
@@ -3120,6 +3759,8 @@ struct AppState {
     quit: bool,
     auto_record: Option<(Instant, Duration)>, // (start at, duration)
     auto_record_stop: Option<Instant>,
+    auto_stream: Option<(Instant, Duration)>,
+    auto_stream_stop: Option<Instant>,
     rec_path: Option<PathBuf>,
 }
 
@@ -3394,7 +4035,7 @@ impl AppState {
             &self.ff,
             &comp,
             &self.log,
-            &p,
+            &[("file".to_string(), p.clone())],
             p.clone(),
         )?;
         self.rec = Some(sess);
@@ -3414,16 +4055,20 @@ impl AppState {
     fn start_stream(&mut self) -> Result<(), String> {
         let comp = self.comp.as_ref().ok_or("pipeline not running")?.sh.clone();
         let s = self.prof.settings.clone();
-        let target = stream_target(&s)?;
+        let (targets, warns) = stream_preflight(&s, &self.ff)?;
         self.log.set_secrets(secrets_of(&s));
-        let label = s.stream_url.split('?').next().unwrap_or("").to_string() + " (key hidden)";
+        for w in &warns {
+            self.log.log(format!("[stream] warning: {w}"));
+        }
+        let names: Vec<&str> = targets.iter().map(|t| t.0.as_str()).collect();
+        let label = format!("{} (keys hidden)", names.join(", "));
         self.stream = Some(OutputSession::start(
             OutKind::Stream,
             &s,
             &self.ff,
             &comp,
             &self.log,
-            &target,
+            &targets,
             label,
         )?);
         Ok(())
@@ -3600,7 +4245,7 @@ impl AppState {
                     self.log.log(format!("auto-record failed: {e}"));
                     eprintln!("auto-record failed: {e}");
                     self.auto_record = None;
-                    self.quit = true;
+                    self.quit = self.auto_stream.is_none();
                 }
             }
             self.update_buttons();
@@ -3611,7 +4256,38 @@ impl AppState {
             self.stop_record();
             self.auto_record = None;
             self.auto_record_stop = None;
-            self.quit = true;
+            self.quit = self.auto_stream.is_none();
+        }
+
+        // Headless/scheduled streaming (--stream N). Time-based only: drops are
+        // handled by per-destination fifo recovery and the session retry logic.
+        if let Some((start_at, dur)) = self.auto_stream
+            && Instant::now() >= start_at
+            && self.stream.is_none()
+            && self.auto_stream_stop.is_none()
+        {
+            match self.start_stream() {
+                Ok(()) => {
+                    self.stream_user_on = true;
+                    self.auto_stream_stop = Some(Instant::now() + dur);
+                }
+                Err(e) => {
+                    self.log.log(format!("auto-stream failed: {e}"));
+                    eprintln!("auto-stream failed: {e}");
+                    self.auto_stream = None;
+                    self.quit = self.auto_record.is_none();
+                }
+            }
+            self.update_buttons();
+        }
+        if let Some(t) = self.auto_stream_stop
+            && Instant::now() >= t
+        {
+            self.stop_stream();
+            self.auto_stream = None;
+            self.auto_stream_stop = None;
+            self.quit = self.auto_record.is_none();
+            self.update_buttons();
         }
 
         // Reap finished background stoppers.
@@ -3649,7 +4325,11 @@ impl AppState {
             parts.push(format!("● REC {}", fmt_dur(r.started.elapsed())));
         }
         if let Some(r) = &self.stream {
-            parts.push(format!("● LIVE {}", fmt_dur(r.started.elapsed())));
+            parts.push(format!(
+                "● LIVE {} → {}",
+                fmt_dur(r.started.elapsed()),
+                r.health_summary()
+            ));
         } else if let Some((at, n)) = self.stream_retry {
             parts.push(format!(
                 "LIVE reconnecting in {}s ({n}/{STREAM_MAX_RETRIES})",
@@ -4029,6 +4709,27 @@ impl AppState {
                     ));
                 }
                 self.save();
+                if cur.video_kbps != self.prof.settings.video_kbps
+                    || cur.keyint_sec != self.prof.settings.keyint_sec
+                    || cur.destinations != self.prof.settings.destinations
+                {
+                    self.show_stream_warnings();
+                }
+            }
+            Msg::Destinations => {
+                let cur = self.prof.settings.destinations.clone();
+                let Some(v) = destinations_dialog(&cur, &self.ff) else {
+                    return;
+                };
+                self.prof.settings.destinations = v;
+                self.log.set_secrets(secrets_of(&self.prof.settings));
+                if self.stream.is_some() {
+                    self.log.log(
+                        "[stream] destination changes apply the next time you start streaming",
+                    );
+                }
+                self.save();
+                self.show_stream_warnings();
             }
             Msg::SaveProfile => {
                 self.save();
@@ -4184,6 +4885,25 @@ impl AppState {
         }
     }
 
+    /// Non-blocking heads-up about service limits (e.g. Kick bitrate/keyframes).
+    fn show_stream_warnings(&self) {
+        if !self.prof.settings.destinations.iter().any(|d| d.enabled) {
+            return;
+        }
+        match stream_preflight(&self.prof.settings, &self.ff) {
+            Ok((_, w)) => {
+                let w: Vec<String> = w
+                    .into_iter()
+                    .filter(|x| !x.starts_with("no audio"))
+                    .collect();
+                if !w.is_empty() {
+                    dialog::message_default(&format!("Streaming notes:\n\n• {}", w.join("\n• ")));
+                }
+            }
+            Err(e) => dialog::alert_default(&e),
+        }
+    }
+
     fn log_ff(&self) {
         if self.ff.ok {
             self.log.log(format!(
@@ -4217,9 +4937,10 @@ impl AppState {
 // ----------------------------------------------------------------------------
 fn usage() -> String {
     format!(
-        "{APP_NAME} v{APP_VERSION}\n\nUSAGE: litecast [--profile FILE] [--record SECONDS]\n\n  \
+        "{APP_NAME} v{APP_VERSION}\n\nUSAGE: litecast [--profile FILE] [--record SECONDS] [--stream SECONDS]\n\n  \
          --profile FILE     use this profile JSON (default: {})\n  \
          --record SECONDS   start recording on launch, stop after SECONDS, then exit\n  \
+         --stream SECONDS   go live to all enabled destinations, stop after SECONDS, then exit\n  \
          --version          print version\n  --help             this help\n",
         config_dir().join("profile.json").display()
     )
@@ -4228,6 +4949,7 @@ fn usage() -> String {
 fn main() {
     let mut profile_path = config_dir().join("profile.json");
     let mut auto_rec: Option<Duration> = None;
+    let mut auto_stream: Option<Duration> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -4246,14 +4968,15 @@ fn main() {
                     std::process::exit(2);
                 }
             },
-            "--record" => match args
+            "--record" | "--stream" => match args
                 .next()
                 .and_then(|v| v.parse::<u64>().ok())
                 .filter(|v| (1..=86_400 * 7).contains(v))
             {
-                Some(s) => auto_rec = Some(Duration::from_secs(s)),
+                Some(s) if a == "--record" => auto_rec = Some(Duration::from_secs(s)),
+                Some(s) => auto_stream = Some(Duration::from_secs(s)),
                 None => {
-                    eprint!("--record needs seconds (1..604800)\n\n{}", usage());
+                    eprint!("{a} needs seconds (1..604800)\n\n{}", usage());
                     std::process::exit(2);
                 }
             },
@@ -4318,6 +5041,8 @@ fn main() {
         quit: false,
         auto_record: auto_rec.map(|d| (Instant::now() + Duration::from_millis(1500), d)),
         auto_record_stop: None,
+        auto_stream: auto_stream.map(|d| (Instant::now() + Duration::from_millis(1500), d)),
+        auto_stream_stop: None,
         rec_path: None,
     };
     st.log_ff();
@@ -4442,26 +5167,92 @@ mod tests {
         assert_eq!(p.current, 0);
     }
 
+    fn dest(svc: &str, url: &str, key: &str) -> Destination {
+        Destination {
+            name: service_info(svc).label.into(),
+            service: svc.into(),
+            url: url.into(),
+            key: key.into(),
+            enabled: true,
+        }
+    }
+
     #[test]
-    fn stream_target_and_redaction() {
-        let mut s = Settings {
-            stream_url: "rtmp://example.com/app/".into(),
-            stream_key: "live_abc123".into(),
+    fn destination_validation_and_redaction() {
+        let k = dest("kick", SERVICES[0].url, "sk_us-west-2_abc123");
+        assert_eq!(
+            dest_target(&k).unwrap(),
+            "rtmps://fa723fc1b171.global-contribute.live-video.net/app/sk_us-west-2_abc123"
+        );
+        // Kick is RTMPS-only; Rumble needs a key; tee syntax chars are rejected.
+        assert!(dest_target(&dest("kick", "rtmp://x/app", "k123")).is_err());
+        assert!(dest_target(&dest("rumble", "rtmp://rtmp.rumble.com/live", "")).is_err());
+        assert!(dest_target(&dest("custom", "rtmp://h/app|file:/etc/passwd", "")).is_err());
+        assert!(dest_target(&dest("custom", "rtmp://h/app", "a[b]")).is_err());
+        assert!(dest_target(&dest("custom", "http://h/app", "")).is_err());
+        assert_eq!(
+            dest_target(&dest("custom", "srt://h:9000?streamid=abcd", "ignored")).unwrap(),
+            "srt://h:9000?streamid=abcd"
+        );
+        let s = Settings {
+            destinations: vec![k, dest("custom", "rtmp://u:pw12@h/app", "live_xyz9")],
             ..Default::default()
         };
-        assert_eq!(
-            stream_target(&s).unwrap(),
-            "rtmp://example.com/app/live_abc123"
-        );
-        s.stream_url = "http://x".into();
-        assert!(stream_target(&s).is_err());
-        s.stream_url = "rtmp://u:p@h/app".into();
         let sec = secrets_of(&s);
-        assert!(sec.contains(&"u:p".to_string()) && sec.contains(&"live_abc123".to_string()));
+        assert!(sec.contains(&"sk_us-west-2_abc123".to_string()));
+        assert!(sec.contains(&"u:pw12".to_string()) && sec.contains(&"live_xyz9".to_string()));
         let l = Logger::default();
         l.set_secrets(sec);
-        l.log("error opening rtmp://h/app/live_abc123");
-        assert!(!l.since(0).1[0].contains("live_abc123"));
+        l.log("[fifo] Error opening rtmps://x/app/sk_us-west-2_abc123: I/O error");
+        assert!(!l.since(0).1[0].contains("abc123"));
+    }
+
+    #[test]
+    fn v1_profile_migrates_to_destination() {
+        // Built explicitly: Profile::default() touches FLTK, which must not
+        // run concurrently from parallel test threads.
+        let json = r#"{"stream_url":"rtmp://rtmp.rumble.com/live","stream_key":"rk_42xyz"}"#;
+        let mut p = Profile {
+            format: 1,
+            settings: serde_json::from_str(json).unwrap(),
+            scenes: vec![],
+            current: 0,
+        };
+        sanitize(&mut p);
+        let d = &p.settings.destinations;
+        assert_eq!(d.len(), 1);
+        assert_eq!(
+            (d[0].service.as_str(), d[0].key.as_str(), d[0].enabled),
+            ("rumble", "rk_42xyz", true)
+        );
+        let out = serde_json::to_string(&p).unwrap();
+        assert!(!out.contains("stream_url") && !out.contains("\"stream_key\""));
+    }
+
+    #[test]
+    fn preflight_rules() {
+        let ff = FfInfo {
+            ok: true,
+            major: 6,
+            out_protocols: ["rtmp".to_string()].into_iter().collect(),
+            ..Default::default()
+        };
+        let mut s = Settings {
+            destinations: vec![dest("kick", SERVICES[0].url, "sk_1234")],
+            video_kbps: 9000,
+            keyint_sec: 4,
+            ..Default::default()
+        };
+        assert!(stream_preflight(&s, &ff).unwrap_err().contains("RTMPS"));
+        let ff = FfInfo {
+            out_protocols: HashSet::new(),
+            ..ff
+        };
+        let (t, w) = stream_preflight(&s, &ff).unwrap();
+        assert_eq!(t.len(), 1);
+        assert!(w.iter().any(|x| x.contains("8000")) && w.iter().any(|x| x.contains("keyframe")));
+        s.destinations[0].enabled = false;
+        assert!(stream_preflight(&s, &ff).is_err());
     }
 
     #[test]
@@ -4476,22 +5267,35 @@ mod tests {
             minor: 1,
             ..Default::default()
         };
-        let a = encoder_args(&s, &ff, OutKind::Record, "/tmp/x.mkv");
+        let a = encoder_args(&s, &ff, OutKind::Record, &["/tmp/x.mkv".into()]);
         let j = a.join(" ");
         assert!(j.contains("-f rawvideo -pix_fmt bgra"));
         assert!(j.contains("amix=inputs=2"));
         assert!(j.contains("-map [aout]"));
         assert!(j.contains("-fps_mode cfr"));
+        assert!(!j.contains("nal-hrd") && !j.contains("anullsrc"));
         assert!(a.last().unwrap() == "file:/tmp/x.mkv");
+
+        // Stream, no audio, two destinations: silent track + tee/fifo fan-out.
         s.audio_api = "none".into();
         let a = encoder_args(
             &s,
             &FfInfo { major: 4, ..ff },
             OutKind::Stream,
-            "rtmp://h/a/k",
+            &["rtmps://k/app/key1".into(), "srt://h:1?streamid=x".into()],
         );
         let j = a.join(" ");
-        assert!(!j.contains("-c:a") && j.contains("-vsync cfr") && j.contains("-f flv"));
+        assert!(
+            j.contains("-re -f lavfi -i anullsrc")
+                && j.contains("-map 1:a")
+                && j.contains("-c:a aac")
+        );
+        assert!(j.contains("-vsync cfr") && j.contains("nal-hrd=cbr"));
+        assert!(j.contains("-f tee -use_fifo 1") && j.contains("+global_header"));
+        assert_eq!(
+            a.last().unwrap(),
+            "[f=flv:flvflags=no_duration_filesize:onfail=ignore]rtmps://k/app/key1|[f=mpegts:onfail=ignore]srt://h:1?streamid=x"
+        );
     }
 
     #[test]

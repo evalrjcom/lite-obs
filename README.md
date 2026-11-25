@@ -1,8 +1,8 @@
-# LiteCast Studio v1.0.0 — User & Developer Guide
+# LiteCast Studio v1.1.0 — User & Developer Guide
 
 [![CI](https://github.com/evalrjcom/lite-obs/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/lite-obs/actions/workflows/ci.yml)
 
-`litecast_v1.0.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
+`litecast_v1.1.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
 
@@ -15,10 +15,10 @@
 | Layout | Z-order up/down, show/hide, X/Y/W/H, opacity 0–100 %, Fill / Center / 1:1 buttons |
 | Preview | Live preview. Click to select, drag to move, Shift-drag (or grab the red corner handle) to resize |
 | Recording | mkv (default, crash-safe), mp4 (faststart), mov, flv, ts. Never overwrites existing files |
-| Streaming | RTMP / RTMPS (Twitch, YouTube, Kick, etc.) and SRT. Auto-reconnect with exponential backoff (6 attempts) |
+| Streaming | **Kick, Rumble**, Twitch, YouTube and custom RTMP/RTMPS/SRT presets. **Multistream** to up to 8 destinations from one encode, with per-destination auto-reconnect so one failing platform never drops the others |
 | Audio | Mic + desktop audio, mixed. Backends: PulseAudio/PipeWire, ALSA, DirectShow, AVFoundation |
 | Encoders | libx264, NVENC, QuickSync, AMF, VAAPI, VideoToolbox (whichever your ffmpeg provides) |
-| Extras | PNG screenshot (F12), JSON profiles, headless `--record N` mode for scheduled or cron recording |
+| Extras | PNG screenshot (F12), JSON profiles, headless `--record N` / `--stream N` modes for scheduled or cron use |
 
 \*Hard caps of 64 scenes and 64 sources per scene protect against corrupt profiles.
 
@@ -33,7 +33,7 @@
 - macOS: ffmpeg with AVFoundation, plus Screen Recording permission granted to the terminal or app.
 
 **Build**
-- Rust 1.87+ (stable, edition 2024), CMake ≥ 3.15, a C++17 compiler.
+- Rust 1.88+ (stable, edition 2024), CMake ≥ 3.15, a C++17 compiler.
 - Debian/Ubuntu packages:
   ```bash
   sudo apt install build-essential cmake ninja-build pkg-config \
@@ -62,10 +62,11 @@ cargo build --release --target x86_64-pc-windows-gnu
 
 ### Command line
 ```
-litecast [--profile FILE] [--record SECONDS] [--version] [--help]
+litecast [--profile FILE] [--record SECONDS] [--stream SECONDS] [--version] [--help]
 ```
 - `--profile FILE`: use a specific profile. Default: `~/.config/litecast/profile.json` on Linux and macOS, `%APPDATA%\litecast\profile.json` on Windows.
 - `--record N`: start recording about 1.5 s after launch, stop after N seconds, finalise the file and exit. Useful with cron or Task Scheduler, e.g. `DISPLAY=:0 litecast --record 3600`.
+- `--stream N`: same, but goes live to every enabled destination for N seconds. Both flags can be combined; the app exits when both finish.
 
 ---
 
@@ -78,7 +79,7 @@ litecast [--profile FILE] [--record SECONDS] [--version] [--help]
    - *Media / Image*: use **Browse…**.
    - *Color*: pick a colour; use opacity for tints.
 3. **Arrange** layers in the preview (drag to move, Shift-drag to resize) or type X/Y/W/H and press **Apply**. **Raise/Lower** change z-order. The list shows the top layer first.
-4. **Settings** (Ctrl+,): canvas size, FPS, encoder, bitrate, recording folder and format, stream URL and key, audio devices, ffmpeg path.
+4. **Settings** (Ctrl+,): canvas size, FPS, encoder, bitrate, recording folder and format, stream destinations, audio devices, ffmpeg path.
 5. **Record** (Ctrl+R) and **Stream** (Ctrl+L) run independently and can run at the same time.
 6. **Screenshot** (F12) saves a PNG of the composed canvas to the recording folder.
 7. Profiles auto-save every 15 s when changed, and on exit. Ctrl+S saves now; File → Save As / Load handle other files.
@@ -90,17 +91,28 @@ litecast [--profile FILE] [--record SECONDS] [--version] [--help]
 | Ctrl+L | Toggle streaming |
 | F12 | Screenshot |
 | Ctrl+, | Settings |
+| Ctrl+D | Stream destinations |
 | Ctrl+S / Ctrl+Shift+S / Ctrl+O | Save / Save As / Load profile |
 | Ctrl+Q | Quit (asks first while live; always finalises recordings) |
 
-### Streaming quick-setup
-| Service | URL | Key |
-|---|---|---|
-| Twitch | `rtmp://live.twitch.tv/app` | your stream key |
-| YouTube | `rtmp://a.rtmp.youtube.com/live2` | your stream key |
-| Custom SRT | `srt://host:port?streamid=...` | leave blank |
+### Streaming to Kick, Rumble & others (multistream)
+Open **Controls → Stream Destinations…** (Ctrl+D), or **Edit…** in Settings. Press **Add**, pick a service, and the server URL fills in automatically. Paste your stream key and press **OK**. Add as many destinations as you like (up to 8) and enable or disable each one. **Ctrl+L** then goes live to every enabled destination at once.
 
-Recommended settings for 1080p30 streaming: libx264 *veryfast*, 4500–6000 kbps, keyframe interval 2 s.
+| Service | Default server URL | Where to get the key | Limits checked by LiteCast |
+|---|---|---|---|
+| **Kick** | `rtmps://fa723fc1b171.global-contribute.live-video.net/app` | Kick Creator Dashboard → stream settings (copy the URL too if it differs from the default) | RTMPS only, ≤ 8000 kbps, CBR, 2 s keyframes |
+| **Rumble** | `rtmp://rtmp.rumble.com/live` | rumble.com → Live Stream / *Get Streamer Configuration*. Keys are per-event unless you enable a static key | keyframes ≤ 2 s recommended |
+| Twitch | `rtmp://live.twitch.tv/app` | Creator Dashboard → Settings → Stream | 2 s keyframes |
+| YouTube | `rtmp://a.rtmp.youtube.com/live2` | YouTube Studio → Go Live → Stream | 2 s keyframes |
+| Custom | any `rtmp://`, `rtmps://` or `srt://host:port?streamid=…` | — | URL syntax only |
+
+How it works and what to expect:
+- **One encode, many outputs.** The canvas is encoded once and fanned out with ffmpeg's `tee` muxer. Each destination gets its own `fifo` queue, so CPU cost does not grow with the number of platforms.
+- **Independent reconnects.** If one platform drops, only that output retries (every 2 s, up to 25 times, restarting on a keyframe). The others carry on. The status bar shows each one: `● LIVE 00:12:31 → Kick ✓, Rumble ⟳`, where ⟳ means it reported an error in the last 10 s.
+- **Pre-flight checks** run when you save destinations or settings, and again on Go Live. Hard errors block the start: no enabled destination, an invalid URL, or an `rtmps://` URL when your ffmpeg lacks TLS support. Warnings are only logged: bitrate above a service limit, keyframe interval mismatch.
+- **Live encoding** uses CBR (`nal-hrd=cbr`) with libx264, as Kick and Rumble require. Recommended for 1080p30: *veryfast*, 6000 kbps (stay ≤ 8000 for Kick), keyframe interval 2 s.
+- **No audio configured?** A silent stereo track is added automatically while streaming, because several platforms, Kick included, reject video-only streams.
+- Changes to destinations apply on the next Go Live.
 
 ### Audio notes
 - **Linux (PulseAudio/PipeWire)**: Mic `default`, Desktop `@DEFAULT_MONITOR@`. **Detect devices** lists everything `pactl` knows about.
@@ -119,7 +131,8 @@ Recommended settings for 1080p30 streaming: libx264 *veryfast*, 4500–6000 kbps
 | Source shows `error:` under Transform | Read the Log panel. The source retries automatically (1 s → 10 s backoff) |
 | `lagged` counter rising | Lower canvas/FPS, use a hardware encoder, or use a faster x264 preset |
 | mp4 won't play after a crash | Use mkv (the default). It stays playable; remux later with `ffmpeg -i in.mkv -c copy out.mp4` |
-| Stream keeps reconnecting | Check the URL and key; the log shows the redacted ffmpeg error |
+| Stream keeps reconnecting / ⟳ next to a destination | Check that destination's URL and key; the log shows the redacted ffmpeg error. Rumble keys are per-event, so generate a new one or enable a static key |
+| "ffmpeg lacks RTMPS" on Go Live | Your ffmpeg was built without TLS. Install a full build (distro ffmpeg, gyan.dev or BtbN). Kick needs RTMPS |
 
 ---
 
@@ -135,7 +148,9 @@ color / image ──────────────────────
           writer thread  writer thread          FLTK preview widget
                │              │
         ffmpeg encoder  ffmpeg encoder  (+ ffmpeg-native audio inputs)
-         (record file)   (RTMP/SRT)
+         (record file)   tee ─┬─ fifo ─▶ Kick (RTMPS)
+                              ├─ fifo ─▶ Rumble (RTMP)
+                              └─ fifo ─▶ … (≤ 8, onfail=ignore)
 ```
 - **UI thread** owns all state (`AppState`). Widget callbacks only push `Msg` values into an `Rc<RefCell<VecDeque>>` queue, which is drained after every `app.wait()`. No `RefCell` borrow is held across modal dialogs, and no FLTK awake ring buffer is involved.
 - **Sources** are keyed by a *signature* (kind + size + FPS + ffmpeg path). Scenes that share an identical source reuse one capture process. Moves and opacity changes never restart a capture; resizes do.
@@ -144,24 +159,25 @@ color / image ──────────────────────
 
 ### Tests
 ```bash
-DISPLAY=:0 cargo test --release   # 8 unit tests: blending, clipping, sanitising, args, redaction, helpers
+DISPLAY=:0 cargo test --release   # 10 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight
 ```
 (One test builds a default profile, which queries monitor geometry, so it needs an X display; Xvfb works.)
 
 ### CI & releases
 `.github/workflows/ci.yml` runs on every push and pull request:
-- **Linux** (Ubuntu 24.04): `cargo fmt --check`, `clippy -D warnings`, unit tests under Xvfb, a release build, and a **headless smoke test**. The smoke test records 4 s of a display + media + colour scene with `--record` and fails if the file has fewer than 60 frames.
+- **Linux** (Ubuntu 24.04): `cargo fmt --check`, `clippy -D warnings`, unit tests under Xvfb, a release build, and a **headless smoke test**. The smoke test records 4 s of a display + media + colour scene with `--record` and fails if the file has fewer than 60 frames. A **multistream smoke test** then runs `--stream` against two local RTMP listeners and checks that both received H.264 + AAC.
 - **Windows** (latest): clippy and release build.
 - Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
 - **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
-  `git tag v1.0.1 && git push origin v1.0.1`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
+  `git tag v1.1.1 && git push origin v1.1.1`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
 
 ### Security model
 - Every child process is spawned with an argv list; no shell is ever invoked.
 - Local paths are passed as `file:<path>`, so a filename can't be read as an ffmpeg protocol (`concat:`, `subfile,`, etc.).
 - Profiles are size-capped (4 MiB), clamped and repaired by `sanitize()`. Encoder, format and backend names are whitelisted. A broken profile is moved aside to `profile.json.bad`.
-- The profile is written atomically with mode **0600** in a 0700 directory, because it contains the stream key.
-- Stream keys, URL credentials and SRT passphrases are **redacted** from the log, the UI and status text.
+- The profile is written atomically with mode **0600** in a 0700 directory, because it contains stream keys.
+- Destination URLs are validated: scheme whitelist (`rtmp`, `rtmps`, `srt`), length caps, and rejection of `| [ ] \\ ' " < > ` { } ^` and whitespace. A crafted key cannot inject a second tee output or ffmpeg options.
+- Stream keys of every destination, URL credentials and SRT passphrases/streamids are **redacted** from the log, the UI and status text.
 - **Known limitation**: the full stream URL, including the key, appears in the ffmpeg command line, which other local users can read via `ps` or `/proc`. ffmpeg offers no way to read the output URL from stdin. Use a single-user machine for streaming.
 
 ### Limits / not yet implemented
@@ -170,4 +186,5 @@ Scene transitions (cut only), text sources, filters (chroma key, crop, colour co
 ---
 
 ## 7. Changelog
+- **1.1.0**: Kick and Rumble destinations, plus Twitch/YouTube/custom presets. Multistream from one encode (tee + fifo) with per-destination reconnect and status. Silent audio track when no audio is configured. CBR for live x264. RTMPS capability check and pre-flight warnings. `--stream N` CLI flag. v1.0 single URL/key profiles migrate automatically. Rust 1.88+.
 - **1.0.0**: initial release.
