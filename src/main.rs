@@ -1544,13 +1544,19 @@ fn blit(dst: &mut [u8], cw: usize, ch: usize, src: &[u8], l: &Layer, opaque: boo
             d.copy_from_slice(s);
             continue;
         }
-        for (dp, sp) in d.chunks_exact_mut(4).zip(s.chunks_exact(4)) {
+        // as_chunks yields [u8; 4] arrays: no per-pixel bounds checks in the blend.
+        for (dp, sp) in d
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(s.as_chunks::<4>().0)
+        {
             let a = div255(sp[3] as u32 * op);
             if a == 0 {
                 continue;
             }
             if a == 255 {
-                dp.copy_from_slice(sp);
+                *dp = *sp;
                 continue;
             }
             let ia = 255 - a;
@@ -1620,7 +1626,7 @@ fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
                 let sy = (y * ch / ph).min(ch - 1);
                 let row = &buf[sy * cw * 4..(sy + 1) * cw * 4];
                 let out = &mut pbuf[y * pw * 3..(y + 1) * pw * 3];
-                for (o, &si) in out.chunks_exact_mut(3).zip(xmap.iter()) {
+                for (o, &si) in out.as_chunks_mut::<3>().0.iter_mut().zip(xmap.iter()) {
                     o[0] = row[si + 2];
                     o[1] = row[si + 1];
                     o[2] = row[si];
