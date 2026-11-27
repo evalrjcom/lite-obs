@@ -1,6 +1,6 @@
 # LiteCast Studio v1.1.0 — User & Developer Guide
 
-[![CI](https://github.com/evalrjcom/lite-obs/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/lite-obs/actions/workflows/ci.yml)
+[![CI](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml)
 
 `litecast_v1.1.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
 
@@ -47,7 +47,7 @@
 ## 3. Build & run
 
 ```bash
-git clone https://github.com/evalrjcom/lite-obs && cd lite-obs
+git clone https://github.com/evalrjcom/litecast && cd litecast
 cargo build --release
 ./target/release/litecast
 ```
