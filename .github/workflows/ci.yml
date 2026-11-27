@@ -125,6 +125,38 @@ jobs:
             [ "${v:-0}" -ge 90 ] && [ "${a:-0}" -ge 100 ] || { echo "::error::destination $i incomplete"; exit 1; }
           done
 
+      - name: Audio balance test (mixer, auto-level, -20 dB target)
+        env:
+          LITECAST_TEST_AUDIO: "1"
+          LITECAST_LOG: "1"
+        run: |
+          set -euo pipefail
+          T="$RUNNER_TEMP/aud"; mkdir -p "$T/rec"
+          # Quiet mic (300 Hz, -37 dB RMS) vs loud desktop (2 kHz, -4 dB RMS): 33 dB apart.
+          cat > "$T/profile.json" <<JSON
+          {"format":1,
+           "settings":{"canvas_w":640,"canvas_h":360,"fps":30,"audio_api":"lavfi",
+             "mic_device":"aevalsrc=0.02*sin(2*PI*300*t):s=48000",
+             "desktop_device":"aevalsrc=0.9*sin(2*PI*2000*t):s=48000",
+             "rec_dir":"$T/rec","rec_format":"mkv"},
+           "scenes":[{"name":"A","sources":[
+             {"id":1,"name":"Tint","kind":{"type":"color","r":20,"g":120,"b":200},
+              "visible":true,"x":0,"y":0,"w":640,"h":360,"opacity":255}]}],
+           "current":0}
+          JSON
+          timeout 90 xvfb-run -a -s "-screen 0 1280x720x24" \
+            ./target/release/litecast --profile "$T/profile.json" --record 14 2> "$T/app.log" \
+            || { cat "$T/app.log"; exit 1; }
+          f=$(ls "$T"/rec/*.mkv | head -1)
+          lvl() { ffmpeg -hide_banner -nostats -ss 10 -i "$f" -vn -af "$1,volumedetect" -f null - 2>&1 \
+                  | sed -n 's/.*mean_volume: \(-*[0-9.]*\) dB.*/\1/p'; }
+          mic=$(lvl "lowpass=f=600,lowpass=f=600"); desk=$(lvl "highpass=f=1200,highpass=f=1200")
+          echo "mic=${mic} dB desktop=${desk} dB (target -20)"
+          awk -v m="$mic" -v d="$desk" 'BEGIN {
+            diff = m - d; if (diff < 0) diff = -diff
+            ok = diff <= 3 && m >= -25 && m <= -15 && d >= -25 && d <= -15
+            if (!ok) { print "::error::audio not balanced"; exit 1 }; print "balanced" }'
+
       - name: Package
         run: |
           set -euo pipefail

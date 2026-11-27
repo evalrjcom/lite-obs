@@ -1,5 +1,5 @@
 // =============================================================================
-//  litecast_v1.2.0 — LiteCast Studio
+//  litecast_v1.3.0 — LiteCast Studio
 //  A lightweight OBS-style recorder / live streamer in Rust + FLTK.
 //
 //  Architecture (one process, ffmpeg used as an external worker binary):
@@ -15,13 +15,23 @@
 //       writer thread    writer thread         FLTK preview widget
 //            │                │
 //   [ffmpeg encoder]   [ffmpeg encoder]
-//     record file        RTMP/SRT stream          (+ ffmpeg-native audio in)
+//     record file        RTMP/SRT stream
+//            ▲                ▲
+//   audio: mic/desktop capture ─▶ rings ─▶ mixer thread (HPF, gate, comp,
+//          auto-level, ducking, limiter, VU meters) ─▶ local pipe per output
 //
 //  Build:   cargo build --release      (needs cmake + X11 dev libs on Linux)
 //  Run:     ./litecast [--profile FILE] [--record SECONDS] [--stream SECONDS] [--version]
 //  Runtime: ffmpeg >= 4.4 on PATH (or set in Settings).
 //
 //  Changelog
+//   1.3.0  Audio processing + VU meters for every backend: mic high-pass,
+//          noise gate and soft-knee compressor; auto-level of mic and
+//          desktop to one loudness target (so neither is louder); optional
+//          desktop ducking under voice; master −1 dBFS limiter; live
+//          Mic/Desktop/Master meters (RMS, peak, hold, gain reduction,
+//          auto-gain) and an Audio Mixer dialog (Ctrl+M). All backends now
+//          feed ffmpeg through the in-app mixer (amix no longer used).
 //   1.2.0  Native Windows audio: WASAPI mic + system-audio loopback captured
 //          in-app, mixed (silence-filled, wall-clock paced) and piped to
 //          ffmpeg over an owner-only named pipe; default on, no Stereo Mix
@@ -185,7 +195,8 @@ impl Logger {
             secs % 60,
             line
         );
-        if cfg!(debug_assertions) {
+        // Echo to stderr in debug builds, or when LITECAST_LOG=1 (CI / headless runs).
+        if cfg!(debug_assertions) || std::env::var_os("LITECAST_LOG").is_some() {
             eprintln!("{line}");
         }
         g.seq += 1;
@@ -236,6 +247,8 @@ struct Settings {
     audio_api: String,
     mic_device: String,
     desktop_device: String,
+    /// v1.3: mic compressor/gate, auto-level, ducking, limiter.
+    audio_dsp: AudioDsp,
     ffmpeg_path: String,
     vaapi_device: String,
 }
@@ -276,6 +289,7 @@ impl Default for Settings {
             audio_api: api.into(),
             mic_device: mic.into(),
             desktop_device: desk.into(),
+            audio_dsp: AudioDsp::default(),
             ffmpeg_path: "ffmpeg".into(),
             vaapi_device: "/dev/dri/renderD128".into(),
         }
@@ -457,6 +471,7 @@ fn sanitize(p: &mut Profile) {
         s.rec_format = d.rec_format.clone();
     }
     migrate_audio(s, cfg!(windows), &d);
+    s.audio_dsp.sanitize();
     if s.ffmpeg_path.trim().is_empty() {
         s.ffmpeg_path = d.ffmpeg_path.clone();
     }
@@ -646,7 +661,10 @@ fn ffmpeg_cmd(prog: &str) -> Command {
 /// a pre-1.2 dshow profile with no devices (which recorded *no audio at
 /// all*) is upgraded to native mic + system audio.
 fn migrate_audio(s: &mut Settings, windows: bool, d: &Settings) {
-    let ok = AUDIO_APIS.contains(&s.audio_api.as_str()) && (windows || s.audio_api != "wasapi");
+    // "lavfi" = synthetic test source for CI, only with LITECAST_TEST_AUDIO=1.
+    let test = s.audio_api == "lavfi" && std::env::var_os("LITECAST_TEST_AUDIO").is_some();
+    let ok = test
+        || (AUDIO_APIS.contains(&s.audio_api.as_str()) && (windows || s.audio_api != "wasapi"));
     let empty_dshow = windows
         && s.audio_api == "dshow"
         && s.mic_device.trim().is_empty()
@@ -1939,69 +1957,35 @@ enum OutKind {
     Stream,
 }
 
-fn audio_inputs(s: &Settings, ff: &FfInfo, audio_pipe: Option<&str>) -> Vec<Vec<String>> {
-    let mut v = vec![];
-    if s.audio_api == "wasapi" {
-        // One pre-mixed input (mic + loopback), fed by our AudioHub.
-        if let Some(p) = audio_pipe {
-            let q: &[&str] = if ff.input_queue_opt() {
-                &["-thread_queue_size", "1024"]
-            } else {
-                &[]
-            };
-            v.push(
-                q.iter()
-                    .chain(&["-f", "f32le", "-ar", "48000", "-ac", "2", "-i"])
-                    .map(|x| x.to_string())
-                    .chain([file_arg(p)])
-                    .collect(),
-            );
-        }
-        return v;
-    }
-    for dev in [&s.mic_device, &s.desktop_device] {
-        let d = dev.trim();
-        if d.is_empty() || s.audio_api == "none" {
-            continue;
-        }
-        let mut a: Vec<String> = if ff.input_queue_opt() {
-            vec!["-thread_queue_size".into(), "1024".into()]
-        } else {
-            Vec::new()
-        };
-        match s.audio_api.as_str() {
-            "pulse" => a.extend(["-f".into(), "pulse".into(), "-i".into(), d.into()]),
-            "alsa" => a.extend(["-f".into(), "alsa".into(), "-i".into(), d.into()]),
-            "dshow" => a.extend([
-                "-f".into(),
-                "dshow".into(),
-                "-audio_buffer_size".into(),
-                "50".into(),
-                "-i".into(),
-                format!("audio={d}"),
-            ]),
-            "avfoundation" => a.extend([
-                "-f".into(),
-                "avfoundation".into(),
-                "-i".into(),
-                format!(":{d}"),
-            ]),
-            _ => continue,
-        }
-        v.push(a);
-    }
-    v
+/// The encoder's audio input: always the one pre-mixed, pre-processed
+/// stream from the AudioHub (`audio_in` = ffmpeg URL of its private pipe).
+fn audio_inputs(ff: &FfInfo, audio_in: Option<&str>) -> Vec<Vec<String>> {
+    let Some(url) = audio_in else {
+        return vec![];
+    };
+    let q: &[&str] = if ff.input_queue_opt() {
+        &["-thread_queue_size", "1024"]
+    } else {
+        &[]
+    };
+    vec![
+        q.iter()
+            .chain(&["-f", "f32le", "-ar", "48000", "-ac", "2", "-i"])
+            .map(|x| x.to_string())
+            .chain([url.to_string()])
+            .collect(),
+    ]
 }
 
 /// Pure function: settings -> encoder argv. Kept side-effect free for testing.
 /// `targets`: one file path for Record; one or more ingest URLs for Stream.
-/// `audio_pipe`: native-audio pipe path when the wasapi backend is active.
+/// `audio_in`: URL of the AudioHub pipe (None = no audio track / silence).
 fn encoder_args(
     s: &Settings,
     ff: &FfInfo,
     kind: OutKind,
     targets: &[String],
-    audio_pipe: Option<&str>,
+    audio_in: Option<&str>,
 ) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut p = |v: &[&str]| a.extend(v.iter().map(|x| x.to_string()));
@@ -2038,7 +2022,7 @@ fn encoder_args(
         "-i",
         "pipe:0",
     ]);
-    let auds = audio_inputs(s, ff, audio_pipe);
+    let auds = audio_inputs(ff, audio_in);
     for ai in &auds {
         a.extend(ai.iter().cloned());
     }
@@ -2062,15 +2046,10 @@ fn encoder_args(
         "h264_qsv" => "format=nv12",
         _ => "format=yuv420p",
     };
-    let mut fc = format!("[0:v]{vf}[vout]");
-    if auds.len() == 2 {
-        fc.push_str(";[1:a][2:a]amix=inputs=2:duration=longest:dropout_transition=0[aout]");
-    }
+    let fc = format!("[0:v]{vf}[vout]");
     p(&["-filter_complex", &fc, "-map", "[vout]"]);
-    match (auds.len(), silent) {
-        (1, _) | (0, true) => p(&["-map", "1:a"]),
-        (2, _) => p(&["-map", "[aout]"]),
-        _ => {}
+    if !auds.is_empty() || silent {
+        p(&["-map", "1:a"]);
     }
     p(&["-c:v", enc]);
     match enc {
@@ -2182,30 +2161,403 @@ fn secrets_of(s: &Settings) -> Vec<String> {
 }
 
 // ----------------------------------------------------------------------------
-// Native audio (v1.2.0): WASAPI mic + system-audio loopback on Windows
+// Native audio engine (v1.3.0): capture → per-source DSP → mixer → encoders
 // ----------------------------------------------------------------------------
-// Mainline ffmpeg has no WASAPI input, and dshow needs a "Stereo Mix"
-// loopback device that most PCs lack, so on Windows audio is captured
-// natively. Each capture thread fills a SrcRing; one mixer thread, paced
-// to the wall clock, sums the rings into 10 ms chunks of 48 kHz stereo f32
-// and fans them out to every running output. Each output receives them on
-// a private, owner-only named pipe that ffmpeg reads as raw f32le.
+// Every backend now feeds LiteCast's own mixer:
+//   * Windows `wasapi`: in-process WASAPI mic + speaker loopback;
+//   * pulse / alsa / dshow / avfoundation: one small ffmpeg capture child per
+//     device, decoding to 48 kHz stereo f32 on its stdout.
+// Each capture thread fills a SrcRing. One mixer thread, paced to the wall
+// clock, runs every source through its DSP chain in 10 ms blocks:
+//   mic:     high-pass 80 Hz → noise gate → compressor → auto-level → trim
+//   desktop: auto-level → trim → ducking (under voice)
+//   master:  sum → peak limiter (−1 dBFS)
+// then fans the block out to every running output (one private pipe each)
+// and publishes VU meters for the UI. Auto-level drives both sources to the
+// same loudness target, which is what keeps mic and system audio balanced.
 //
-// WASAPI loopback delivers *no packets* while nothing is playing; the
-// mixer zero-fills, so ffmpeg always gets a continuous, correctly-timed
-// audio stream (sample count == wall clock) and never stalls.
+// WASAPI loopback delivers *no packets* while nothing plays; the mixer
+// zero-fills, so ffmpeg always gets a continuous, correctly-timed stream.
 
 const AUD_RATE: usize = 48_000;
 const AUD_CH: usize = 2;
+/// Frames per 10 ms block.
+const AUD_FRAMES: usize = AUD_RATE / 100;
 /// 10 ms of interleaved stereo samples.
-const AUD_CHUNK: usize = AUD_RATE / 100 * AUD_CH;
+const AUD_CHUNK: usize = AUD_FRAMES * AUD_CH;
 /// A ring starts (or restarts after an underrun) only once 30 ms are
 /// buffered, so capture jitter does not turn into crackle.
 const RING_PRIME: usize = AUD_CHUNK * 3;
 /// Above 250 ms the ring is trimmed back to the prime level: this bounds
 /// latency and absorbs device-clock vs wall-clock drift.
-#[cfg_attr(not(windows), allow(dead_code))]
 const RING_MAX: usize = AUD_RATE / 4 * AUD_CH;
+const DB_FLOOR: f32 = -90.0;
+
+fn db(x: f32) -> f32 {
+    if x <= 1e-9 {
+        DB_FLOOR
+    } else {
+        (20.0 * x.log10()).max(DB_FLOOR)
+    }
+}
+fn undb(d: f32) -> f32 {
+    10f32.powf(d / 20.0)
+}
+/// One-pole smoothing coefficient for a time constant, per sample.
+fn coef(ms: f32) -> f32 {
+    1.0 - (-1.0 / (ms * 0.001 * AUD_RATE as f32)).exp()
+}
+
+/// User-facing processing settings (persisted in the profile, live-tunable).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+struct AudioDsp {
+    /// Loudness both sources are levelled to (short-term RMS, dBFS).
+    target_db: i32,
+    mic_gate: bool,
+    gate_db: i32,
+    mic_comp: bool,
+    comp_db: i32,
+    comp_ratio: u32,
+    mic_level: bool,
+    desk_level: bool,
+    /// Lower desktop audio by this many dB while the mic is active (0 = off).
+    duck_db: u32,
+    mic_trim_db: i32,
+    desk_trim_db: i32,
+    mic_mute: bool,
+    desk_mute: bool,
+    limiter: bool,
+}
+
+impl Default for AudioDsp {
+    fn default() -> Self {
+        Self {
+            target_db: -20,
+            mic_gate: true,
+            gate_db: -50,
+            mic_comp: true,
+            comp_db: -26,
+            comp_ratio: 3,
+            mic_level: true,
+            desk_level: true,
+            duck_db: 0,
+            mic_trim_db: 0,
+            desk_trim_db: 0,
+            mic_mute: false,
+            desk_mute: false,
+            limiter: true,
+        }
+    }
+}
+
+impl AudioDsp {
+    /// Clamp everything loaded from a (possibly hostile) profile.
+    fn sanitize(&mut self) {
+        self.target_db = self.target_db.clamp(-36, -6);
+        self.gate_db = self.gate_db.clamp(-80, -20);
+        self.comp_db = self.comp_db.clamp(-50, -6);
+        self.comp_ratio = self.comp_ratio.clamp(1, 20);
+        self.duck_db = self.duck_db.min(30);
+        self.mic_trim_db = self.mic_trim_db.clamp(-30, 20);
+        self.desk_trim_db = self.desk_trim_db.clamp(-30, 20);
+    }
+}
+
+/// RBJ biquad, transposed direct form II, one per channel.
+#[derive(Clone, Copy, Default)]
+struct Biquad {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+impl Biquad {
+    fn highpass(f: f32) -> Self {
+        let w = 2.0 * std::f32::consts::PI * f / AUD_RATE as f32;
+        let (c, alpha) = (w.cos(), w.sin() / (2.0 * std::f32::consts::FRAC_1_SQRT_2));
+        let a0 = 1.0 + alpha;
+        Self {
+            b0: (1.0 + c) / 2.0 / a0,
+            b1: -(1.0 + c) / a0,
+            b2: (1.0 + c) / 2.0 / a0,
+            a1: -2.0 * c / a0,
+            a2: (1.0 - alpha) / a0,
+            ..Default::default()
+        }
+    }
+    #[inline]
+    fn run(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        y
+    }
+}
+
+fn block_rms_db(b: &[f32]) -> f32 {
+    if b.is_empty() {
+        return DB_FLOOR;
+    }
+    let ms = b.iter().map(|x| x * x).sum::<f32>() / b.len() as f32;
+    db(ms.sqrt())
+}
+fn block_peak(b: &[f32]) -> f32 {
+    b.iter().fold(0f32, |m, x| m.max(x.abs()))
+}
+
+/// Per-source processing state.
+struct SrcDsp {
+    is_mic: bool,
+    hp: [Biquad; 2],
+    gate_open: bool,
+    gate_hold: u32,
+    gate_gain: f32,
+    comp_gr_db: f32,
+    /// Smoothed mean-square energy of active blocks (auto-level detector).
+    lvl_ms: f32,
+    lvl_init: bool,
+    agc_db: f32,
+    gain: f32,
+    duck_db: f32,
+    /// Meter outputs.
+    m_rms: f32,
+    m_peak: f32,
+    m_hold: f32,
+    m_hold_n: u32,
+    active: bool,
+}
+
+impl SrcDsp {
+    fn new(is_mic: bool) -> Self {
+        Self {
+            is_mic,
+            hp: [Biquad::highpass(80.0); 2],
+            gate_open: false,
+            gate_hold: 0,
+            gate_gain: 0.0,
+            comp_gr_db: 0.0,
+            lvl_ms: 0.0,
+            lvl_init: false,
+            agc_db: 0.0,
+            gain: 1.0,
+            duck_db: 0.0,
+            m_rms: DB_FLOOR,
+            m_peak: DB_FLOOR,
+            m_hold: DB_FLOOR,
+            m_hold_n: 0,
+            active: false,
+        }
+    }
+
+    /// Process one interleaved stereo block in place. `duck` = dB of ducking
+    /// requested for this block (desktop only).
+    fn process(&mut self, b: &mut [f32], p: &AudioDsp, duck: f32) {
+        let mic = self.is_mic;
+        // 1. High-pass (mic): rumble/handling noise would otherwise drive the
+        //    compressor and auto-level.
+        if mic {
+            for f in b.chunks_exact_mut(AUD_CH) {
+                f[0] = self.hp[0].run(f[0]);
+                f[1] = self.hp[1].run(f[1]);
+            }
+        }
+        let in_db = block_rms_db(b);
+        // 2. Noise gate with hysteresis + 200 ms hold; closes to −40 dB (not
+        //    hard mute) so room tone does not chop.
+        if mic && p.mic_gate {
+            let thr = p.gate_db as f32;
+            if in_db > thr {
+                self.gate_open = true;
+                self.gate_hold = 20;
+            } else if in_db < thr - 6.0 {
+                if self.gate_hold > 0 {
+                    self.gate_hold -= 1;
+                } else {
+                    self.gate_open = false;
+                }
+            }
+            let target = if self.gate_open { 1.0 } else { undb(-40.0) };
+            let c = if target > self.gate_gain {
+                coef(2.0)
+            } else {
+                coef(120.0)
+            };
+            for f in b.chunks_exact_mut(AUD_CH) {
+                self.gate_gain += (target - self.gate_gain) * c;
+                f[0] *= self.gate_gain;
+                f[1] *= self.gate_gain;
+            }
+        } else {
+            self.gate_open = in_db > p.gate_db as f32;
+            self.gate_gain = 1.0;
+        }
+        // 3. Compressor (mic): stereo-linked peak detector, 6 dB soft knee,
+        //    5 ms attack / 150 ms release on the gain reduction.
+        if mic && p.mic_comp {
+            let (thr, r, knee) = (p.comp_db as f32, p.comp_ratio.max(1) as f32, 6.0f32);
+            let slope = 1.0 - 1.0 / r;
+            let (ca, cr) = (coef(5.0), coef(150.0));
+            for f in b.chunks_exact_mut(AUD_CH) {
+                let x = db(f[0].abs().max(f[1].abs()));
+                let over = x - thr;
+                let gr = if over <= -knee / 2.0 {
+                    0.0
+                } else if over >= knee / 2.0 {
+                    over * slope
+                } else {
+                    slope * (over + knee / 2.0).powi(2) / (2.0 * knee)
+                };
+                let c = if gr > self.comp_gr_db { ca } else { cr };
+                self.comp_gr_db += (gr - self.comp_gr_db) * c;
+                let g = undb(-self.comp_gr_db);
+                f[0] *= g;
+                f[1] *= g;
+            }
+        } else {
+            self.comp_gr_db = 0.0;
+        }
+        // 4. Auto-level: 400 ms loudness detector on *active* blocks only (so
+        //    silence/noise is never boosted), slew-limited gain toward target.
+        let lvl_on = if mic { p.mic_level } else { p.desk_level };
+        let pre = block_rms_db(b);
+        let act = if mic {
+            if p.mic_gate {
+                self.gate_open
+            } else {
+                pre > -50.0
+            }
+        } else {
+            pre > -55.0
+        };
+        self.active = act;
+        if lvl_on {
+            if act {
+                let ms = undb(pre).powi(2);
+                if self.lvl_init {
+                    let a = 1.0 - (-0.01f32 / 0.4).exp();
+                    self.lvl_ms += (ms - self.lvl_ms) * a;
+                } else {
+                    self.lvl_ms = ms;
+                    self.lvl_init = true;
+                }
+                let (lo, hi) = if mic { (-20.0, 24.0) } else { (-20.0, 15.0) };
+                let want = (p.target_db as f32 - db(self.lvl_ms.sqrt())).clamp(lo, hi);
+                // Down 10 dB/s, up 3 dB/s; and never let a sudden loud block
+                // through more than 6 dB above target (anti-blast).
+                let step = if want < self.agc_db { 0.10 } else { 0.03 };
+                self.agc_db += (want - self.agc_db).clamp(-step, step);
+                let blast = pre + self.agc_db - (p.target_db as f32 + 6.0);
+                if blast > 0.0 {
+                    self.agc_db -= blast;
+                }
+            }
+        } else {
+            self.agc_db = 0.0;
+            self.lvl_init = false;
+        }
+        // 5. Trim, mute, ducking → one gain ramped across the block (no zipper).
+        let (trim, mute) = if mic {
+            (p.mic_trim_db, p.mic_mute)
+        } else {
+            (p.desk_trim_db, p.desk_mute)
+        };
+        let dc = if duck > self.duck_db { 0.25 } else { 0.02 }; // ~40 ms in, ~0.5 s out
+        self.duck_db += (duck - self.duck_db) * dc;
+        let g1 = if mute {
+            0.0
+        } else {
+            undb(self.agc_db + trim as f32 - self.duck_db)
+        };
+        let (g0, n) = (self.gain, (b.len() / AUD_CH) as f32);
+        for (i, f) in b.chunks_exact_mut(AUD_CH).enumerate() {
+            let g = g0 + (g1 - g0) * (i as f32 + 1.0) / n;
+            f[0] *= g;
+            f[1] *= g;
+        }
+        self.gain = g1;
+        meter_update(
+            &mut self.m_rms,
+            &mut self.m_peak,
+            &mut self.m_hold,
+            &mut self.m_hold_n,
+            b,
+        );
+    }
+}
+
+/// VU ballistics per 10 ms block: instant rise, 20 dB/s fall; peak hold 1.5 s.
+fn meter_update(rms: &mut f32, peak: &mut f32, hold: &mut f32, hold_n: &mut u32, b: &[f32]) {
+    let r = block_rms_db(b);
+    let pk = db(block_peak(b));
+    *rms = r.max(*rms - 0.2);
+    *peak = pk.max(*peak - 0.2);
+    if pk >= *hold {
+        *hold = pk;
+        *hold_n = 150;
+    } else if *hold_n > 0 {
+        *hold_n -= 1;
+    } else {
+        *hold = (*hold - 0.3).max(DB_FLOOR);
+    }
+}
+
+/// Master peak limiter: instant attack, 100 ms release, −1 dBFS ceiling.
+struct Limiter {
+    g: f32,
+    gr_db: f32,
+}
+
+impl Limiter {
+    fn run(&mut self, b: &mut [f32], on: bool) {
+        let ceil = undb(-1.0);
+        let rel = coef(100.0);
+        let mut min_g = 1.0f32;
+        for f in b.chunks_exact_mut(AUD_CH) {
+            if on {
+                let pk = f[0].abs().max(f[1].abs());
+                if pk * self.g > ceil {
+                    self.g = ceil / pk;
+                } else {
+                    self.g += (1.0 - self.g) * rel;
+                }
+                min_g = min_g.min(self.g);
+                f[0] *= self.g;
+                f[1] *= self.g;
+            }
+            f[0] = f[0].clamp(-1.0, 1.0);
+            f[1] = f[1].clamp(-1.0, 1.0);
+        }
+        self.gr_db = -db(min_g);
+    }
+}
+
+/// Snapshot published for the UI (~every 10 ms).
+#[derive(Clone, Debug, Default)]
+struct ChanMeter {
+    label: String,
+    rms: f32,
+    peak: f32,
+    hold: f32,
+    /// Compressor / limiter gain reduction, dB (≥ 0).
+    gr: f32,
+    /// Auto-level gain, dB.
+    agc: f32,
+    active: bool,
+    muted: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Meters {
+    chans: Vec<ChanMeter>,
+    master: ChanMeter,
+    target_db: f32,
+    updated: Option<Instant>,
+}
 
 #[derive(Default)]
 struct SrcRing {
@@ -2214,7 +2566,6 @@ struct SrcRing {
 }
 
 impl SrcRing {
-    #[cfg_attr(not(windows), allow(dead_code))]
     fn push(&mut self, s: &[f32]) {
         self.q.extend(s);
         if self.q.len() > RING_MAX {
@@ -2222,30 +2573,22 @@ impl SrcRing {
             self.q.drain(..excess - excess % AUD_CH); // keep L/R alignment
         }
     }
-}
-
-/// Sum every primed ring into `out` (zero-filled first), clamp to [-1, 1].
-/// A ring that runs dry contributes silence and must re-prime.
-fn mix_into(rings: &[Arc<Mutex<SrcRing>>], out: &mut [f32]) {
-    out.fill(0.0);
-    for r in rings {
-        let mut g = lock(r);
-        if !g.primed {
-            if g.q.len() < RING_PRIME {
-                continue;
+    /// Fill `out` from the ring; silence while unprimed or on underrun.
+    fn take(&mut self, out: &mut [f32]) {
+        out.fill(0.0);
+        if !self.primed {
+            if self.q.len() < RING_PRIME {
+                return;
             }
-            g.primed = true;
+            self.primed = true;
         }
-        let n = out.len().min(g.q.len());
-        for (o, s) in out.iter_mut().zip(g.q.drain(..n)) {
-            *o += s;
+        let n = out.len().min(self.q.len());
+        for (o, s) in out.iter_mut().zip(self.q.drain(..n)) {
+            *o = s;
         }
         if n < out.len() {
-            g.primed = false; // underrun: wait for a fresh cushion
+            self.primed = false; // underrun: wait for a fresh cushion
         }
-    }
-    for o in out.iter_mut() {
-        *o = o.clamp(-1.0, 1.0);
     }
 }
 
@@ -2259,36 +2602,50 @@ fn pcm_bytes(s: &[f32]) -> Vec<u8> {
 }
 
 type AudioChunk = Arc<Vec<u8>>;
+type Subs = Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>;
 
-/// Shared capture + mixer. Held by `Arc` in each output session using it;
-/// dropping the last reference stops and joins every thread.
+/// One configured capture source.
+#[derive(Clone, Debug, PartialEq)]
+enum CapSpec {
+    /// Native WASAPI device ("default" or friendly name); loopback = speakers.
+    Wasapi { dev: String, loopback: bool },
+    /// ffmpeg capture child; argv decodes the device to f32le on stdout.
+    Ffmpeg { prog: String, args: Vec<String> },
+}
+
+/// The whole mixing pipeline. AppState keeps one running for live meters;
+/// each output holds an `Arc` too, so a recording survives a settings change.
 struct AudioHub {
-    /// Settings fingerprint, so a running hub is reused only if unchanged.
+    /// Capture-config fingerprint: a hub is reused only if unchanged.
     key: String,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>,
+    subs: Subs,
     stop: Arc<AtomicBool>,
+    children: Vec<Arc<Mutex<Option<Child>>>>,
     threads: Vec<JoinHandle<()>>,
 }
 
 impl AudioHub {
-    fn key_for(s: &Settings) -> String {
-        format!("{}|{}|{}", s.audio_api, s.mic_device, s.desktop_device)
-    }
-
-    /// `sources`: (label, device, loopback). Device "default" = system default.
-    fn start(key: String, sources: Vec<(String, String, bool)>, log: &Logger) -> Arc<Self> {
+    /// `sources`: (label, is_mic, spec).
+    fn start(
+        key: String,
+        sources: Vec<(String, bool, CapSpec)>,
+        dsp: Arc<Mutex<AudioDsp>>,
+        meters: Arc<Mutex<Meters>>,
+        log: &Logger,
+    ) -> Arc<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        let subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>> = Arc::default();
-        let mut threads = vec![];
-        let mut rings = vec![];
-        for (label, dev, loopback) in sources {
+        let subs: Subs = Arc::default();
+        let (mut threads, mut rings, mut children, mut chans) = (vec![], vec![], vec![], vec![]);
+        for (label, is_mic, spec) in sources {
             let ring: Arc<Mutex<SrcRing>> = Arc::default();
+            let child: Arc<Mutex<Option<Child>>> = Arc::default();
             rings.push(ring.clone());
+            children.push(child.clone());
+            chans.push((label.clone(), is_mic));
             let (stop, log) = (stop.clone(), log.clone());
             if let Ok(h) = thread::Builder::new()
                 .name(format!("audio-{label}"))
-                .spawn(move || capture_supervisor(label, dev, loopback, ring, stop, log))
+                .spawn(move || capture_supervisor(label, spec, ring, child, stop, log))
             {
                 threads.push(h);
             }
@@ -2296,7 +2653,7 @@ impl AudioHub {
         let (stop2, subs2) = (stop.clone(), subs.clone());
         if let Ok(h) = thread::Builder::new()
             .name("audio-mixer".into())
-            .spawn(move || mixer_loop(rings, subs2, stop2))
+            .spawn(move || mixer_loop(rings, chans, dsp, meters, subs2, stop2))
         {
             threads.push(h);
         }
@@ -2304,13 +2661,13 @@ impl AudioHub {
             key,
             subs,
             stop,
+            children,
             threads,
         })
     }
 
     /// ~1 s of buffering per subscriber; a stalled encoder loses chunks
     /// instead of stalling the mixer (or the other outputs).
-    #[cfg_attr(not(windows), allow(dead_code))]
     fn subscribe(&self) -> std::sync::mpsc::Receiver<AudioChunk> {
         let (tx, rx) = std::sync::mpsc::sync_channel(100);
         lock(&self.subs).push(tx);
@@ -2321,6 +2678,11 @@ impl AudioHub {
 impl Drop for AudioHub {
     fn drop(&mut self) {
         self.stop.store(true, Relaxed);
+        for c in &self.children {
+            if let Some(ch) = lock(c).as_mut() {
+                let _ = ch.kill(); // unblocks the stdout reader
+            }
+        }
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
@@ -2331,64 +2693,198 @@ impl Drop for AudioHub {
 /// second of real time (drift-free; catches up after scheduling hiccups).
 fn mixer_loop(
     rings: Vec<Arc<Mutex<SrcRing>>>,
-    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>,
+    chans: Vec<(String, bool)>,
+    dsp: Arc<Mutex<AudioDsp>>,
+    meters: Arc<Mutex<Meters>>,
+    subs: Subs,
     stop: Arc<AtomicBool>,
 ) {
     let t0 = Instant::now();
-    let mut chunks: u64 = 0;
-    let mut buf = vec![0f32; AUD_CHUNK];
+    let mut blocks: u64 = 0;
+    let mut states: Vec<SrcDsp> = chans.iter().map(|c| SrcDsp::new(c.1)).collect();
+    let mut tmp = vec![0f32; AUD_CHUNK];
+    let mut mix = vec![0f32; AUD_CHUNK];
+    let mut lim = Limiter { g: 1.0, gr_db: 0.0 };
+    let (mut m_rms, mut m_peak, mut m_hold, mut m_hold_n) = (DB_FLOOR, DB_FLOOR, DB_FLOOR, 0u32);
     while !stop.load(Relaxed) {
         let due = t0.elapsed().as_millis() as u64 / 10;
-        if chunks >= due {
+        if blocks >= due {
             thread::sleep(Duration::from_millis(3));
             continue;
         }
         // > 1 s behind (machine suspended?): skip ahead rather than burst.
-        if due - chunks > 100 {
-            chunks = due - 1;
+        if due - blocks > 100 {
+            blocks = due - 1;
         }
-        while chunks < due {
-            mix_into(&rings, &mut buf);
-            let c: AudioChunk = Arc::new(pcm_bytes(&buf));
+        let p = *lock(&dsp);
+        while blocks < due {
+            mix.fill(0.0);
+            // Mic first: its activity drives desktop ducking in the same block.
+            let mut voice = false;
+            for pass in [true, false] {
+                for ((ring, st), _) in rings.iter().zip(states.iter_mut()).zip(&chans) {
+                    if st.is_mic != pass {
+                        continue;
+                    }
+                    lock(ring).take(&mut tmp);
+                    let duck = if !st.is_mic && voice && !p.mic_mute {
+                        p.duck_db as f32
+                    } else {
+                        0.0
+                    };
+                    st.process(&mut tmp, &p, duck);
+                    if st.is_mic && st.active {
+                        voice = true;
+                    }
+                    for (m, x) in mix.iter_mut().zip(&tmp) {
+                        *m += x;
+                    }
+                }
+            }
+            lim.run(&mut mix, p.limiter);
+            meter_update(&mut m_rms, &mut m_peak, &mut m_hold, &mut m_hold_n, &mix);
+            let c: AudioChunk = Arc::new(pcm_bytes(&mix));
             lock(&subs).retain(|tx| {
                 !matches!(
                     tx.try_send(c.clone()),
                     Err(std::sync::mpsc::TrySendError::Disconnected(_))
                 )
             });
-            chunks += 1;
+            blocks += 1;
         }
+        let mut m = lock(&meters);
+        m.chans = states
+            .iter()
+            .zip(&chans)
+            .map(|(s, c)| ChanMeter {
+                label: c.0.clone(),
+                rms: s.m_rms,
+                peak: s.m_peak,
+                hold: s.m_hold,
+                gr: s.comp_gr_db,
+                agc: s.agc_db,
+                active: s.active,
+                muted: if s.is_mic { p.mic_mute } else { p.desk_mute },
+            })
+            .collect();
+        m.master = ChanMeter {
+            label: "Master".into(),
+            rms: m_rms,
+            peak: m_peak,
+            hold: m_hold,
+            gr: lim.gr_db,
+            ..Default::default()
+        };
+        m.target_db = p.target_db as f32;
+        m.updated = Some(Instant::now());
     }
 }
 
 /// Keeps one source alive: reopens after errors (device unplugged, default
-/// device changed) with backoff, until stopped.
+/// device changed, capture child died) with backoff, until stopped.
 fn capture_supervisor(
     label: String,
-    dev: String,
-    loopback: bool,
+    spec: CapSpec,
     ring: Arc<Mutex<SrcRing>>,
+    child: Arc<Mutex<Option<Child>>>,
     stop: Arc<AtomicBool>,
     log: Logger,
 ) {
     let mut backoff = Duration::from_secs(1);
     while !stop.load(Relaxed) {
-        match capture_run(&label, &dev, loopback, &ring, &stop, &log) {
-            Ok(()) => break,
-            Err(e) => {
-                log.log(format!(
-                    "[audio] {label}: {e} — retrying in {}s",
-                    backoff.as_secs()
-                ));
-                sleep_interruptible(backoff, &stop);
-                backoff = (backoff * 2).min(Duration::from_secs(10));
+        let t = Instant::now();
+        let r = match &spec {
+            CapSpec::Wasapi { dev, loopback } => {
+                capture_wasapi(&label, dev, *loopback, &ring, &stop, &log)
             }
+            CapSpec::Ffmpeg { prog, args } => {
+                capture_ffmpeg(&label, prog, args, &ring, &child, &stop, &log)
+            }
+        };
+        if stop.load(Relaxed) {
+            break;
         }
+        if t.elapsed() > Duration::from_secs(30) {
+            backoff = Duration::from_secs(1); // it had been working
+        }
+        let why = r.err().unwrap_or_else(|| "capture ended".into());
+        log.log(format!(
+            "[audio] {label}: {why} — retrying in {}s",
+            backoff.as_secs()
+        ));
+        sleep_interruptible(backoff, &stop);
+        backoff = (backoff * 2).min(Duration::from_secs(10));
     }
 }
 
+/// ffmpeg capture child → stdout f32le → ring.
+fn capture_ffmpeg(
+    label: &str,
+    prog: &str,
+    args: &[String],
+    ring: &Arc<Mutex<SrcRing>>,
+    child: &Arc<Mutex<Option<Child>>>,
+    stop: &AtomicBool,
+    log: &Logger,
+) -> Result<(), String> {
+    let mut cmd = ffmpeg_cmd(prog);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut ch = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start ffmpeg: {e}"))?;
+    let mut out = ch.stdout.take().ok_or("no stdout")?;
+    let last = Arc::new(Mutex::new(String::new()));
+    let drain = ch
+        .stderr
+        .take()
+        .and_then(|e| spawn_stderr_drain(e, format!("audio {label}"), log.clone(), last.clone()));
+    *lock(child) = Some(ch);
+    if stop.load(Relaxed) {
+        // Raced with hub shutdown: make sure the child cannot outlive it.
+        if let Some(c) = lock(child).as_mut() {
+            let _ = c.kill();
+        }
+    }
+    log.log(format!("[audio] {label}: capturing via ffmpeg"));
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut carry: Vec<u8> = Vec::with_capacity(4);
+    let mut samples: Vec<f32> = Vec::with_capacity(4096);
+    loop {
+        let n = match out.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        carry.extend_from_slice(&buf[..n]);
+        let whole = carry.len() / 4 * 4;
+        samples.clear();
+        samples.extend(
+            carry[..whole]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+        );
+        carry.drain(..whole);
+        lock(ring).push(&samples);
+    }
+    if let Some(mut c) = lock(child).take() {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(d) = drain {
+        let _ = d.join();
+    }
+    let e = lock(&last).clone();
+    Err(if e.is_empty() {
+        "capture process exited".into()
+    } else {
+        e
+    })
+}
+
 #[cfg(not(windows))]
-fn capture_run(
+fn capture_wasapi(
     _label: &str,
     _dev: &str,
     _loopback: bool,
@@ -2396,11 +2892,11 @@ fn capture_run(
     _stop: &AtomicBool,
     _log: &Logger,
 ) -> Result<(), String> {
-    Err("native audio capture is only available on Windows".into())
+    Err("WASAPI is only available on Windows".into())
 }
 
 #[cfg(windows)]
-fn capture_run(
+fn capture_wasapi(
     label: &str,
     dev: &str,
     loopback: bool,
@@ -2495,9 +2991,8 @@ fn capture_run(
     res
 }
 
-/// Random, unguessable pipe name (no RNG crate: OS-seeded SipHash keys).
-#[cfg_attr(not(windows), allow(dead_code))]
-fn pipe_name() -> String {
+/// Random, unguessable token (no RNG crate: OS-seeded SipHash keys).
+fn rand_hex() -> String {
     use std::hash::{BuildHasher, Hasher};
     let part = || {
         let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -2509,22 +3004,20 @@ fn pipe_name() -> String {
         );
         h.finish()
     };
-    format!(
-        r"\\.\pipe\litecast-{}-{:016x}{:016x}",
-        std::process::id(),
-        part(),
-        part()
-    )
+    format!("{:016x}{:016x}", part(), part())
 }
 
-/// Server end of the per-output audio pipe. Created *before* ffmpeg starts
-/// so its input open succeeds immediately.
+/// Per-output transport for the mixed audio, created *before* ffmpeg so
+/// its input open succeeds immediately.
+///  * Windows: named pipe, owner-only DACL, single instance, no remote.
+///  * Unix: Unix-domain socket inside a fresh 0700 directory.
 #[cfg(windows)]
 struct AudioPipe {
     name: String,
     handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
+// SAFETY: the HANDLE is a plain kernel object handle, used by one thread.
 #[cfg(windows)]
 unsafe impl Send for AudioPipe {}
 
@@ -2542,7 +3035,7 @@ impl AudioPipe {
         use windows_sys::Win32::System::Pipes::{
             CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
         };
-        let name = pipe_name();
+        let name = format!(r"\\.\pipe\litecast-{}-{}", std::process::id(), rand_hex());
         let wname: Vec<u16> = name.encode_utf16().chain([0]).collect();
         // Owner-only DACL: other local users cannot connect and read the mic.
         let sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)"
@@ -2589,12 +3082,20 @@ impl AudioPipe {
         }
     }
 
+    fn url(&self) -> String {
+        format!("file:{}", self.name)
+    }
+
     /// Unblock a ConnectNamedPipe that will never be satisfied (ffmpeg died
     /// before opening its input) by connecting to ourselves once.
     fn poke(name: &str) {
         use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
-        let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        let w: Vec<u16> = name
+            .trim_start_matches("file:")
+            .encode_utf16()
+            .chain([0])
+            .collect();
         // SAFETY: plain CreateFile/CloseHandle on a NUL-terminated name.
         unsafe {
             let h = CreateFileW(
@@ -2665,16 +3166,159 @@ impl Drop for AudioPipe {
     }
 }
 
-/// Settings → capture sources for the native backend.
-fn native_sources(s: &Settings) -> Vec<(String, String, bool)> {
-    let mut v = vec![];
-    if !s.mic_device.trim().is_empty() {
-        v.push(("mic".into(), s.mic_device.trim().to_string(), false));
+#[cfg(unix)]
+struct AudioPipe {
+    dir: PathBuf,
+    path: PathBuf,
+    listener: std::os::unix::net::UnixListener,
+}
+
+#[cfg(unix)]
+impl AudioPipe {
+    fn create() -> Result<Self, String> {
+        use std::os::unix::fs::DirBuilderExt;
+        // Fresh 0700 directory (create fails if it exists: no symlink races);
+        // only this user can reach the socket inside it.
+        let dir = std::env::temp_dir().join(format!(
+            "litecast-{}-{}",
+            std::process::id(),
+            &rand_hex()[..16]
+        ));
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| format!("audio socket dir: {e}"))?;
+        let path = dir.join("a.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).map_err(|e| {
+            let _ = fs::remove_dir(&dir);
+            format!("audio socket: {e}")
+        })?;
+        let _ = listener.set_nonblocking(true);
+        Ok(Self {
+            dir,
+            path,
+            listener,
+        })
     }
-    if !s.desktop_device.trim().is_empty() {
-        v.push(("desktop".into(), s.desktop_device.trim().to_string(), true));
+
+    fn url(&self) -> String {
+        format!("unix:{}", self.path.display())
+    }
+
+    fn poke(_url: &str) {} // serve() polls; nothing can block forever
+
+    fn serve(self, rx: std::sync::mpsc::Receiver<AudioChunk>, stop: Arc<AtomicBool>) {
+        let t = Instant::now();
+        let mut sock = loop {
+            if stop.load(Relaxed) || t.elapsed() > Duration::from_secs(20) {
+                return;
+            }
+            match self.listener.accept() {
+                Ok((s, _)) => break s,
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        };
+        let _ = sock.set_nonblocking(false);
+        let _ = sock.set_write_timeout(Some(Duration::from_secs(5)));
+        while !stop.load(Relaxed) {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(c) => {
+                    if sock.write_all(&c).is_err() {
+                        return; // ffmpeg went away (SIGPIPE is ignored by std)
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = sock.shutdown(std::net::Shutdown::Write); // clean EOF
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AudioPipe {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+        let _ = fs::remove_dir(&self.dir);
+    }
+}
+
+/// Settings → capture sources: (label, is_mic, spec).
+fn audio_sources(s: &Settings, ff: &FfInfo) -> Vec<(String, bool, CapSpec)> {
+    let mut v = vec![];
+    if s.audio_api == "none" {
+        return v;
+    }
+    for (label, is_mic, dev) in [
+        ("Mic", true, s.mic_device.trim()),
+        ("Desktop", false, s.desktop_device.trim()),
+    ] {
+        if dev.is_empty() {
+            continue;
+        }
+        let spec = if s.audio_api == "wasapi" {
+            CapSpec::Wasapi {
+                dev: dev.to_string(),
+                loopback: !is_mic,
+            }
+        } else {
+            match audio_capture_args(s, ff, dev) {
+                Some(args) => CapSpec::Ffmpeg {
+                    prog: s.ffmpeg_path.clone(),
+                    args,
+                },
+                None => continue,
+            }
+        };
+        v.push((label.to_string(), is_mic, spec));
     }
     v
+}
+
+/// argv for an ffmpeg capture child: device → 48 kHz stereo f32le on stdout.
+fn audio_capture_args(s: &Settings, ff: &FfInfo, dev: &str) -> Option<Vec<String>> {
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"]
+        .iter()
+        .map(|x| x.to_string())
+        .collect();
+    if ff.input_queue_opt() {
+        a.extend(["-thread_queue_size".into(), "1024".into()]);
+    }
+    let input: Vec<String> = match s.audio_api.as_str() {
+        "pulse" => vec!["-f".into(), "pulse".into(), "-i".into(), dev.into()],
+        "alsa" => vec!["-f".into(), "alsa".into(), "-i".into(), dev.into()],
+        "dshow" => vec![
+            "-f".into(),
+            "dshow".into(),
+            "-audio_buffer_size".into(),
+            "50".into(),
+            "-i".into(),
+            format!("audio={dev}"),
+        ],
+        "avfoundation" => vec![
+            "-f".into(),
+            "avfoundation".into(),
+            "-i".into(),
+            format!(":{dev}"),
+        ],
+        // Test-only synthetic source (CI): never offered in the UI, and
+        // rejected by sanitize() unless LITECAST_TEST_AUDIO=1.
+        "lavfi" => vec![
+            "-re".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            dev.into(),
+        ],
+        _ => return None,
+    };
+    a.extend(input);
+    a.extend(
+        ["-vn", "-f", "f32le", "-ar", "48000", "-ac", "2", "pipe:1"]
+            .iter()
+            .map(|x| x.to_string()),
+    );
+    Some(a)
 }
 
 /// Runs on its own thread: initialising COM as MTA on the FLTK UI thread
@@ -2711,6 +3355,73 @@ fn wasapi_devices() -> DevList {
     vec![]
 }
 
+/// Horizontal VU strip renderer (−60…0 dBFS): RMS bar in green/yellow/red
+/// zones, peak line, peak-hold tick, target marker, readout text.
+fn draw_meter_row(x: i32, y: i32, w: i32, h: i32, m: &ChanMeter, target: f32, live: bool) {
+    use draw::*;
+    let lw = 54; // label column
+    let tw = 92; // readout column
+    let bx = x + lw;
+    let bw = (w - lw - tw).max(20);
+    let pos = |d: f32| bx + ((d.clamp(-60.0, 0.0) + 60.0) / 60.0 * bw as f32) as i32;
+    set_draw_color(Color::from_rgb(200, 200, 205));
+    set_font(Font::Helvetica, 11);
+    draw_text2(&m.label, x, y, lw - 4, h, Align::Left | Align::Inside);
+    // Activity LED: gate open / signal above the auto-level floor.
+    if live && m.active && !m.muted {
+        draw_rect_fill(bx - 8, y + h / 2 - 2, 5, 5, Color::from_rgb(80, 220, 110));
+    }
+    draw_rect_fill(bx, y + 3, bw, h - 6, Color::from_rgb(28, 28, 32));
+    if live && !m.muted {
+        // Zones: ≤ −20 green, −20…−9 yellow, > −9 red.
+        let zones = [
+            (-60.0, -20.0, Color::from_rgb(60, 190, 90)),
+            (-20.0, -9.0, Color::from_rgb(225, 200, 60)),
+            (-9.0, 0.0, Color::from_rgb(230, 70, 60)),
+        ];
+        for (a, b, c) in zones {
+            let hi = m.rms.min(b);
+            if hi > a {
+                let (x0, x1) = (pos(a), pos(hi));
+                draw_rect_fill(x0, y + 4, (x1 - x0).max(1), h - 8, c);
+            }
+        }
+        set_draw_color(Color::from_rgb(235, 235, 240));
+        let px = pos(m.peak);
+        draw_line(px, y + 4, px, y + h - 5);
+        if m.hold > -60.0 {
+            set_draw_color(if m.hold > -1.0 {
+                Color::from_rgb(255, 60, 60)
+            } else {
+                Color::White
+            });
+            let hx = pos(m.hold);
+            draw_rect_fill(hx - 1, y + 3, 2, h - 6, get_color());
+        }
+    }
+    // Target marker (where auto-level aims RMS).
+    set_draw_color(Color::from_rgb(110, 160, 255));
+    let tx = pos(target);
+    draw_line(tx, y + 2, tx, y + h - 3);
+    // Readout.
+    set_draw_color(Color::from_rgb(200, 200, 205));
+    let txt = if !live {
+        "idle".to_string()
+    } else if m.muted {
+        "muted".to_string()
+    } else {
+        let mut t = format!("{:>4.0} dB", m.rms.max(-99.0));
+        if m.gr >= 0.5 {
+            t.push_str(&format!(" GR{:.0}", m.gr));
+        }
+        if m.agc.abs() >= 0.5 && m.label != "Master" {
+            t.push_str(&format!(" {:+.0}", m.agc));
+        }
+        t
+    };
+    draw_text2(&txt, bx + bw + 4, y, tw - 4, h, Align::Left | Align::Inside);
+}
+
 struct OutputSession {
     kind: OutKind,
     child: Arc<Mutex<Option<Child>>>,
@@ -2724,9 +3435,8 @@ struct OutputSession {
     label: String,
     /// Stream only: (name, url, last error time) per destination.
     health: DestHealth,
-    /// Native audio: pipe-feeding thread, its pipe name, and the hub.
+    /// Native audio: pipe-feeding thread, its ffmpeg URL, and the hub.
     audio_writer: Option<JoinHandle<()>>,
-    #[cfg_attr(not(windows), allow(dead_code))]
     audio_pipe: Option<String>,
     _hub: Option<Arc<AudioHub>>,
 }
@@ -2745,15 +3455,11 @@ impl OutputSession {
     ) -> Result<Self, String> {
         let urls: Vec<String> = targets.iter().map(|t| t.1.clone()).collect();
         // The pipe must exist before ffmpeg opens its inputs.
-        #[cfg(windows)]
         let pipe = match &hub {
             Some(_) => Some(AudioPipe::create()?),
             None => None,
         };
-        #[cfg(windows)]
-        let pipe_name: Option<String> = pipe.as_ref().map(|p| p.name.clone());
-        #[cfg(not(windows))]
-        let pipe_name: Option<String> = None;
+        let pipe_name: Option<String> = pipe.as_ref().map(AudioPipe::url);
         let args = encoder_args(s, ff, kind, &urls, pipe_name.as_deref());
         let mut cmd = ffmpeg_cmd(&s.ffmpeg_path);
         cmd.args(&args)
@@ -2821,7 +3527,6 @@ impl OutputSession {
                 .spawn(move || writer_loop(stdin, comp2, stop, dead, frames, log2, tag))
                 .map_err(|e| e.to_string())?,
         );
-        #[cfg(windows)]
         if let (Some(p), Some(h)) = (pipe, &hub) {
             let (rx, stop) = (h.subscribe(), sess.stop.clone());
             sess.audio_writer = thread::Builder::new()
@@ -2888,7 +3593,6 @@ impl OutputSession {
                     while !a.is_finished() && t.elapsed() < Duration::from_secs(2) {
                         thread::sleep(Duration::from_millis(20));
                     }
-                    #[cfg(windows)]
                     if !a.is_finished()
                         && let Some(n) = &self.audio_pipe
                     {
@@ -3080,6 +3784,7 @@ enum Msg {
     Screenshot,
     Settings,
     Destinations,
+    AudioMixer,
     SaveProfile,
     SaveProfileAs,
     LoadProfile,
@@ -3150,7 +3855,12 @@ fn small_btn(l: &str, tip: &str) -> Button {
     b
 }
 
-fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
+fn build_ui(
+    q: &Q,
+    pv: Arc<PreviewShared>,
+    ov: Arc<Mutex<Overlay>>,
+    meters: Arc<Mutex<Meters>>,
+) -> Ui {
     let mut win = Window::default()
         .with_size(1280, 820)
         .with_label(&format!("{APP_NAME} v{APP_VERSION}"));
@@ -3213,6 +3923,12 @@ fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
         "&Controls/Stream &Destinations…",
         Shortcut::Ctrl | 'd',
         Msg::Destinations,
+    );
+    add(
+        &mut mb,
+        "&Controls/&Audio Mixer…",
+        Shortcut::Ctrl | 'm',
+        Msg::AudioMixer,
     );
     add(&mut mb, "&Help/&About", Shortcut::None, Msg::About);
     main.fixed(&mb, 26);
@@ -3400,6 +4116,70 @@ fn build_ui(q: &Q, pv: Arc<PreviewShared>, ov: Arc<Mutex<Overlay>>) -> Ui {
     Frame::default();
     c4.end();
     dock.fixed(&c4, 170);
+
+    // Audio column: live VU meters (post-processing) + mixer button.
+    let mut ca = Flex::default().column();
+    ca.set_pad(3);
+    let ha = col_header("Audio");
+    ca.fixed(&ha, 20);
+    let mut vu = Frame::default();
+    vu.set_frame(FrameType::FlatBox);
+    vu.set_color(Color::from_rgb(36, 36, 41));
+    {
+        let meters = meters.clone();
+        vu.draw(move |f| {
+            let (x, y, w, h) = (f.x(), f.y(), f.w(), f.h());
+            draw::draw_rect_fill(x, y, w, h, Color::from_rgb(36, 36, 41));
+            let m = lock(&meters).clone();
+            let live = m
+                .updated
+                .map(|t| t.elapsed() < Duration::from_millis(500))
+                .unwrap_or(false);
+            let mut rows: Vec<ChanMeter> = m.chans.clone();
+            if rows.is_empty() {
+                draw::set_draw_color(Color::from_rgb(160, 160, 165));
+                draw::set_font(Font::Helvetica, 11);
+                draw::draw_text2(
+                    "No audio sources\n(Settings → audio)",
+                    x,
+                    y,
+                    w,
+                    h,
+                    Align::Center | Align::Inside,
+                );
+                return;
+            }
+            rows.push(m.master.clone());
+            let rh = ((h - 8) / rows.len() as i32).clamp(16, 30);
+            for (i, r) in rows.iter().enumerate() {
+                draw_meter_row(
+                    x + 4,
+                    y + 4 + i as i32 * rh,
+                    w - 8,
+                    rh,
+                    r,
+                    m.target_db,
+                    live,
+                );
+            }
+        });
+    }
+    let mut b_mix = Button::default().with_label("Mixer…");
+    b_mix.set_tooltip("Compressor, noise gate, auto-level, ducking, limiter");
+    b_mix.set_callback(q.cb(Msg::AudioMixer));
+    ca.fixed(&b_mix, 28);
+    ca.end();
+    dock.fixed(&ca, 300);
+    // ~20 Hz meter refresh, only while the window is visible.
+    {
+        let mut vu = vu.clone();
+        app::add_timeout3(0.05, move |h| {
+            if vu.visible_r() {
+                vu.redraw();
+            }
+            app::repeat_timeout3(0.05, h);
+        });
+    }
 
     // Log column
     let mut c5 = Flex::default().column();
@@ -3980,6 +4760,258 @@ reconnects on its own. Double-click a row to edit.",
 }
 
 /// Add/Edit one destination with service presets.
+/// Audio processing dialog. Every change applies live to the running mixer
+/// (watch the meters, listen); Cancel restores the previous settings.
+fn audio_mixer_dialog(cur: AudioDsp, live: Arc<Mutex<AudioDsp>>) -> Option<AudioDsp> {
+    let mut win = Window::default()
+        .with_size(560, 540)
+        .center_screen()
+        .with_label("Audio Mixer");
+    let sl = |x: i32, y: i32, w: i32, l: &str, lo: f64, hi: f64, v: f64| {
+        let mut s = HorValueSlider::new(x, y, w, 22, None);
+        s.set_range(lo, hi);
+        s.set_step(1.0, 1);
+        s.set_value(v);
+        let mut f = Frame::new(x - 170, y, 165, 22, None).with_label(l);
+        f.set_align(Align::Right | Align::Inside);
+        f.set_label_size(12);
+        s
+    };
+    let hdr = |y: i32, t: &str| {
+        let mut f = Frame::new(15, y, 530, 22, None).with_label(t);
+        f.set_label_font(Font::HelveticaBold);
+        f.set_align(Align::Left | Align::Inside);
+    };
+    hdr(10, "Balance");
+    let target = sl(
+        190,
+        36,
+        340,
+        "Target loudness (dBFS):",
+        -36.0,
+        -6.0,
+        cur.target_db as f64,
+    );
+    let mut note = Frame::new(20, 60, 520, 20, None).with_label(
+        "Auto-level drives Mic and Desktop to this level, so neither drowns out the other.",
+    );
+    note.set_label_size(11);
+    note.set_align(Align::Left | Align::Inside);
+    hdr(88, "Microphone");
+    let m_level = CheckButton::new(20, 112, 250, 22, "Auto-level (normalize)");
+    let m_gate = CheckButton::new(20, 138, 160, 22, "Noise gate");
+    let gate = sl(
+        370,
+        138,
+        160,
+        "open above (dBFS):",
+        -80.0,
+        -20.0,
+        cur.gate_db as f64,
+    );
+    let m_comp = CheckButton::new(20, 164, 160, 22, "Compressor");
+    let comp = sl(
+        370,
+        164,
+        160,
+        "threshold (dBFS):",
+        -50.0,
+        -6.0,
+        cur.comp_db as f64,
+    );
+    let ratio = sl(
+        370,
+        190,
+        160,
+        "ratio (:1):",
+        1.0,
+        20.0,
+        cur.comp_ratio as f64,
+    );
+    let m_trim = sl(
+        190,
+        216,
+        250,
+        "Mic trim (dB):",
+        -30.0,
+        20.0,
+        cur.mic_trim_db as f64,
+    );
+    let m_mute = CheckButton::new(455, 216, 80, 22, "Mute");
+    hdr(250, "Desktop / system audio");
+    let d_level = CheckButton::new(20, 274, 250, 22, "Auto-level (normalize)");
+    let duck = sl(
+        190,
+        300,
+        340,
+        "Duck under voice (dB):",
+        0.0,
+        30.0,
+        cur.duck_db as f64,
+    );
+    let d_trim = sl(
+        190,
+        326,
+        250,
+        "Desktop trim (dB):",
+        -30.0,
+        20.0,
+        cur.desk_trim_db as f64,
+    );
+    let d_mute = CheckButton::new(455, 326, 80, 22, "Mute");
+    hdr(360, "Master");
+    let limiter = CheckButton::new(
+        20,
+        384,
+        400,
+        22,
+        "Peak limiter at −1 dBFS (prevents clipping)",
+    );
+    let mut help = Frame::new(20, 412, 520, 70, None).with_label(
+        "Meters: bar = loudness (RMS), white line = peak, tick = peak hold, blue = target.\n\
+         GR = gain reduction by compressor/limiter; ±N = auto-level gain.\n\
+         Ducking 0 = off. Changes are live; OK saves them to the profile.",
+    );
+    help.set_label_size(11);
+    help.set_align(Align::Left | Align::Inside | Align::Top | Align::Wrap);
+    let mut reset = Button::new(20, 495, 120, 30, "Defaults");
+    let mut ok = Button::new(350, 495, 90, 30, "OK");
+    let mut cancel = Button::new(450, 495, 90, 30, "Cancel");
+    win.end();
+    m_level.set_checked(cur.mic_level);
+    m_gate.set_checked(cur.mic_gate);
+    m_comp.set_checked(cur.mic_comp);
+    m_mute.set_checked(cur.mic_mute);
+    d_level.set_checked(cur.desk_level);
+    d_mute.set_checked(cur.desk_mute);
+    limiter.set_checked(cur.limiter);
+
+    let read = {
+        let (target, gate, comp, ratio, m_trim, duck, d_trim) = (
+            target.clone(),
+            gate.clone(),
+            comp.clone(),
+            ratio.clone(),
+            m_trim.clone(),
+            duck.clone(),
+            d_trim.clone(),
+        );
+        let (m_level, m_gate, m_comp, m_mute, d_level, d_mute, limiter) = (
+            m_level.clone(),
+            m_gate.clone(),
+            m_comp.clone(),
+            m_mute.clone(),
+            d_level.clone(),
+            d_mute.clone(),
+            limiter.clone(),
+        );
+        Rc::new(move || {
+            let mut d = AudioDsp {
+                target_db: target.value().round() as i32,
+                mic_gate: m_gate.is_checked(),
+                gate_db: gate.value().round() as i32,
+                mic_comp: m_comp.is_checked(),
+                comp_db: comp.value().round() as i32,
+                comp_ratio: ratio.value().round() as u32,
+                mic_level: m_level.is_checked(),
+                desk_level: d_level.is_checked(),
+                duck_db: duck.value().round() as u32,
+                mic_trim_db: m_trim.value().round() as i32,
+                desk_trim_db: d_trim.value().round() as i32,
+                mic_mute: m_mute.is_checked(),
+                desk_mute: d_mute.is_checked(),
+                limiter: limiter.is_checked(),
+            };
+            d.sanitize();
+            d
+        })
+    };
+    let push = {
+        let (read, live) = (read.clone(), live.clone());
+        move || *lock(&live) = read()
+    };
+    for mut w in [
+        target.clone(),
+        gate.clone(),
+        comp.clone(),
+        ratio.clone(),
+        m_trim.clone(),
+        duck.clone(),
+        d_trim.clone(),
+    ] {
+        let push = push.clone();
+        w.set_callback(move |_| push());
+    }
+    for mut w in [
+        m_level.clone(),
+        m_gate.clone(),
+        m_comp.clone(),
+        m_mute.clone(),
+        d_level.clone(),
+        d_mute.clone(),
+        limiter.clone(),
+    ] {
+        let push = push.clone();
+        w.set_callback(move |_| push());
+    }
+    {
+        let d = AudioDsp::default();
+        let (mut target, mut gate, mut comp, mut ratio, mut m_trim, mut duck, mut d_trim) = (
+            target.clone(),
+            gate.clone(),
+            comp.clone(),
+            ratio.clone(),
+            m_trim.clone(),
+            duck.clone(),
+            d_trim.clone(),
+        );
+        let (m_level, m_gate, m_comp, m_mute, d_level, d_mute, limiter) = (
+            m_level.clone(),
+            m_gate.clone(),
+            m_comp.clone(),
+            m_mute.clone(),
+            d_level.clone(),
+            d_mute.clone(),
+            limiter.clone(),
+        );
+        let push = push.clone();
+        reset.set_callback(move |_| {
+            target.set_value(d.target_db as f64);
+            gate.set_value(d.gate_db as f64);
+            comp.set_value(d.comp_db as f64);
+            ratio.set_value(d.comp_ratio as f64);
+            m_trim.set_value(d.mic_trim_db as f64);
+            duck.set_value(d.duck_db as f64);
+            d_trim.set_value(d.desk_trim_db as f64);
+            m_level.set_checked(d.mic_level);
+            m_gate.set_checked(d.mic_gate);
+            m_comp.set_checked(d.mic_comp);
+            m_mute.set_checked(d.mic_mute);
+            d_level.set_checked(d.desk_level);
+            d_mute.set_checked(d.desk_mute);
+            limiter.set_checked(d.limiter);
+            push();
+        });
+    }
+    let result = Rc::new(Cell::new(0));
+    {
+        let (res, mut w) = (result.clone(), win.clone());
+        ok.set_callback(move |_| {
+            res.set(1);
+            w.hide();
+        });
+    }
+    {
+        let (res, mut w) = (result.clone(), win.clone());
+        cancel.set_callback(move |_| {
+            res.set(2);
+            w.hide();
+        });
+    }
+    modal_run(&mut win);
+    (result.get() == 1).then(|| read())
+}
+
 fn dest_edit_dialog(init: Option<&Destination>, ff: &FfInfo) -> Option<Destination> {
     let mut win = Window::default()
         .with_size(620, 330)
@@ -4409,8 +5441,12 @@ struct AppState {
     auto_stream: Option<(Instant, Duration)>,
     auto_stream_stop: Option<Instant>,
     rec_path: Option<PathBuf>,
-    /// Shared native-audio hub; alive while any output holds it.
-    audio_hub: std::sync::Weak<AudioHub>,
+    /// Running audio engine (live meters); outputs hold their own Arc.
+    audio_hub: Option<Arc<AudioHub>>,
+    /// Live DSP parameters shared with the mixer thread.
+    dsp: Arc<Mutex<AudioDsp>>,
+    /// Latest VU snapshot from the mixer, drawn by the meter widget.
+    meters: Arc<Mutex<Meters>>,
 }
 
 impl AppState {
@@ -4444,6 +5480,7 @@ impl AppState {
             self.pv.clone(),
         ));
         self.apply_scene();
+        self.ensure_audio();
     }
     fn stop_pipeline(&mut self) {
         for (_, rt) in self.runtimes.drain() {
@@ -4673,24 +5710,37 @@ impl AppState {
     // --- outputs -------------------------------------------------------------
     /// Native audio hub for a new output: reuse the running one when the
     /// audio settings are unchanged (record + stream share one capture).
-    fn audio_hub(&mut self) -> Option<Arc<AudioHub>> {
-        let s = &self.prof.settings;
-        if !cfg!(windows) || s.audio_api != "wasapi" {
-            return None;
-        }
-        let src = native_sources(s);
-        if src.is_empty() {
-            return None;
-        }
-        let key = AudioHub::key_for(s);
-        if let Some(h) = self.audio_hub.upgrade()
-            && h.key == key
+    /// Bring the audio engine in line with the settings: restart capture
+    /// only if the sources changed; DSP parameters apply live.
+    fn ensure_audio(&mut self) {
+        *lock(&self.dsp) = self.prof.settings.audio_dsp;
+        let src = audio_sources(&self.prof.settings, &self.ff);
+        let key = format!("{src:?}");
+        if self
+            .audio_hub
+            .as_ref()
+            .map(|h| h.key == key)
+            .unwrap_or(false)
         {
-            return Some(h);
+            return;
         }
-        let h = AudioHub::start(key, src, &self.log);
-        self.audio_hub = Arc::downgrade(&h);
-        Some(h)
+        // Old hub keeps running for any output still holding it.
+        self.audio_hub = None;
+        *lock(&self.meters) = Meters::default();
+        if !src.is_empty() {
+            self.audio_hub = Some(AudioHub::start(
+                key,
+                src,
+                self.dsp.clone(),
+                self.meters.clone(),
+                &self.log,
+            ));
+        }
+    }
+
+    fn audio_hub(&mut self) -> Option<Arc<AudioHub>> {
+        self.ensure_audio();
+        self.audio_hub.clone()
     }
 
     fn start_record(&mut self) -> Result<(), String> {
@@ -5373,6 +6423,8 @@ impl AppState {
                 if needs_restart {
                     self.stop_pipeline();
                     self.start_pipeline();
+                } else {
+                    self.ensure_audio();
                 }
                 if self.ff.ok
                     && !self.ff.encoders.is_empty()
@@ -5405,6 +6457,17 @@ impl AppState {
                 }
                 self.save();
                 self.show_stream_warnings();
+            }
+            Msg::AudioMixer => {
+                let cur = self.prof.settings.audio_dsp;
+                match audio_mixer_dialog(cur, self.dsp.clone()) {
+                    Some(n) => {
+                        self.prof.settings.audio_dsp = n;
+                        *lock(&self.dsp) = n;
+                        self.save();
+                    }
+                    None => *lock(&self.dsp) = cur, // cancel: undo live edits
+                }
             }
             Msg::SaveProfile => {
                 self.save();
@@ -5689,7 +6752,8 @@ fn main() {
         req: AtomicU64::new(0),
     });
     let ov = Arc::new(Mutex::new(Overlay::default()));
-    let mut ui = build_ui(&q, pv.clone(), ov.clone());
+    let meters: Arc<Mutex<Meters>> = Arc::default();
+    let mut ui = build_ui(&q, pv.clone(), ov.clone(), meters.clone());
     ui.win.show();
 
     let ff = detect_ffmpeg(&prof.settings.ffmpeg_path);
@@ -5718,7 +6782,9 @@ fn main() {
         auto_record_stop: None,
         auto_stream: auto_stream.map(|d| (Instant::now() + Duration::from_millis(1500), d)),
         auto_stream_stop: None,
-        audio_hub: std::sync::Weak::new(),
+        audio_hub: None,
+        dsp: Arc::new(Mutex::new(AudioDsp::default())),
+        meters: meters.clone(),
         rec_path: None,
     };
     st.log_ff();
@@ -5943,16 +7009,23 @@ mod tests {
             minor: 1,
             ..Default::default()
         };
-        let a = encoder_args(&s, &ff, OutKind::Record, &["/tmp/x.mkv".into()], None);
+        let a = encoder_args(
+            &s,
+            &ff,
+            OutKind::Record,
+            &["/tmp/x.mkv".into()],
+            Some("unix:/tmp/d/a.sock"),
+        );
         let j = a.join(" ");
         assert!(j.contains("-f rawvideo -pix_fmt bgra"));
-        assert!(j.contains("amix=inputs=2"));
-        assert!(j.contains("-map [aout]"));
+        // One pre-mixed input from the AudioHub; no ffmpeg-side mixing.
+        assert!(j.contains("-f f32le -ar 48000 -ac 2 -i unix:/tmp/d/a.sock"));
+        assert!(j.contains("-map 1:a") && !j.contains("amix") && !j.contains("pulse"));
         assert!(j.contains("-fps_mode cfr"));
         assert!(!j.contains("nal-hrd") && !j.contains("anullsrc"));
         assert!(a.last().unwrap() == "file:/tmp/x.mkv");
-        // ffmpeg 4-6: input queue option on the pipe and both audio devices.
-        assert_eq!(j.matches("-thread_queue_size").count(), 3);
+        // ffmpeg 4-6: input queue option on the video pipe and audio input.
+        assert_eq!(j.matches("-thread_queue_size").count(), 2);
         // 7.x ignores it; current/git builds reject it on inputs (Windows
         // "Error parsing options for input file pipe:0") -> never emitted.
         for major in [7, 8, 99] {
@@ -5996,45 +7069,152 @@ mod tests {
         );
     }
 
-    #[test]
-    fn native_audio_mixer() {
-        let ring = |v: &[f32]| {
-            let r: Arc<Mutex<SrcRing>> = Arc::default();
-            lock(&r).push(v);
-            r
-        };
-        // Not yet primed (< 30 ms) -> silence, samples kept for later.
-        let short = ring(&vec![0.5; AUD_CHUNK]);
-        let mut out = vec![1.0f32; AUD_CHUNK];
-        mix_into(std::slice::from_ref(&short), &mut out);
-        assert!(out.iter().all(|&x| x == 0.0));
-        assert_eq!(lock(&short).q.len(), AUD_CHUNK);
-        // Two primed sources sum and clamp; empty loopback = silence.
-        let mic = ring(&vec![0.25; RING_PRIME]);
-        let desk = ring(&vec![0.9; RING_PRIME]);
-        let idle: Arc<Mutex<SrcRing>> = Arc::default();
-        mix_into(&[mic.clone(), desk.clone(), idle], &mut out);
-        assert!(out.iter().all(|&x| x == 1.0)); // 0.25 + 0.9 clamped
-        assert_eq!(lock(&mic).q.len(), RING_PRIME - AUD_CHUNK);
-        // Underrun: partial chunk zero-padded, ring must re-prime.
-        let thin = ring(&vec![0.1; RING_PRIME]);
-        lock(&thin).primed = true;
-        lock(&thin).q.truncate(AUD_CHUNK / 2);
-        mix_into(std::slice::from_ref(&thin), &mut out);
-        assert_eq!(out[0], 0.1);
-        assert_eq!(out[AUD_CHUNK - 1], 0.0);
-        assert!(!lock(&thin).primed);
-        // Overflow trims back to the prime level, keeping L/R alignment.
-        let big = ring(&vec![0.0; RING_MAX + 1001]);
-        assert_eq!(lock(&big).q.len() % AUD_CH, (RING_MAX + 1001) % AUD_CH);
-        assert!(lock(&big).q.len() <= RING_PRIME + 1);
-        assert_eq!(pcm_bytes(&[1.0, -0.5]), [0, 0, 128, 63, 0, 0, 0, 191]);
-        assert!(pipe_name().starts_with(r"\\.\pipe\litecast-"));
-        assert_ne!(pipe_name(), pipe_name());
+    /// Interleaved stereo sine at `amp` (peak), `secs` long.
+    fn sine(freq: f32, amp: f32, secs: f32) -> Vec<f32> {
+        let n = (AUD_RATE as f32 * secs) as usize;
+        (0..n)
+            .flat_map(|i| {
+                let v =
+                    amp * (2.0 * std::f32::consts::PI * freq * i as f32 / AUD_RATE as f32).sin();
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// Run a signal through a SrcDsp block by block; returns the output.
+    fn run_dsp(st: &mut SrcDsp, p: &AudioDsp, sig: &[f32], duck: f32) -> Vec<f32> {
+        let mut out = Vec::with_capacity(sig.len());
+        for b in sig.chunks(AUD_CHUNK) {
+            let mut blk = b.to_vec();
+            st.process(&mut blk, p, duck);
+            out.extend(blk);
+        }
+        out
+    }
+
+    fn tail_rms_db(x: &[f32], secs: f32) -> f32 {
+        let n = ((AUD_RATE as f32 * secs) as usize * AUD_CH).min(x.len());
+        block_rms_db(&x[x.len() - n..])
     }
 
     #[test]
-    fn native_audio_settings_and_args() {
+    fn audio_ring_and_transport() {
+        let mut r = SrcRing::default();
+        let mut out = vec![1.0f32; AUD_CHUNK];
+        r.push(&vec![0.5; AUD_CHUNK]);
+        r.take(&mut out); // not primed (< 30 ms): silence, data kept
+        assert!(out.iter().all(|&x| x == 0.0) && r.q.len() == AUD_CHUNK);
+        r.push(&vec![0.5; RING_PRIME]);
+        r.take(&mut out);
+        assert!(out.iter().all(|&x| x == 0.5) && r.primed);
+        r.q.truncate(AUD_CHUNK / 2); // underrun: zero-padded, re-prime
+        r.take(&mut out);
+        assert_eq!((out[0], out[AUD_CHUNK - 1], r.primed), (0.5, 0.0, false));
+        r.push(&vec![0.0; RING_MAX + 1001]); // overflow trims to the cushion
+        assert!(r.q.len() <= RING_PRIME + 1);
+        assert_eq!(r.q.len() % AUD_CH, (RING_MAX + 1001) % AUD_CH);
+        assert_eq!(pcm_bytes(&[1.0, -0.5]), [0, 0, 128, 63, 0, 0, 0, 191]);
+        assert_ne!(rand_hex(), rand_hex());
+        assert_eq!(rand_hex().len(), 32);
+    }
+
+    #[test]
+    fn audio_dsp_behaviour() {
+        let off = AudioDsp {
+            mic_gate: false,
+            mic_comp: false,
+            mic_level: false,
+            desk_level: false,
+            ..AudioDsp::default()
+        };
+        // High-pass: 20 Hz rumble cut > 10 dB, 1 kHz voice untouched.
+        let mut st = SrcDsp::new(true);
+        let lo = run_dsp(&mut st, &off, &sine(20.0, 0.5, 1.0), 0.0);
+        assert!(tail_rms_db(&lo, 0.5) < db(0.5 / 2f32.sqrt()) - 10.0);
+        let mut st = SrcDsp::new(true);
+        let hi = run_dsp(&mut st, &off, &sine(1000.0, 0.5, 1.0), 0.0);
+        assert!((tail_rms_db(&hi, 0.5) - db(0.5 / 2f32.sqrt())).abs() < 0.5);
+        // Compressor: −6 dBFS peaks, threshold −26, 3:1 → ≈ 13 dB reduction.
+        let comp = AudioDsp {
+            mic_comp: true,
+            comp_db: -26,
+            comp_ratio: 3,
+            ..off
+        };
+        let mut st = SrcDsp::new(true);
+        let y = run_dsp(&mut st, &comp, &sine(1000.0, 0.5, 1.0), 0.0);
+        let gr = db(0.5) - db(block_peak(&y[y.len() - 9600..]));
+        assert!((11.0..=15.0).contains(&gr), "gain reduction {gr}");
+        // Noise gate: −70 dBFS hiss with gate at −50 is pushed down ~40 dB.
+        let gate = AudioDsp {
+            mic_gate: true,
+            gate_db: -50,
+            ..off
+        };
+        let mut st = SrcDsp::new(true);
+        let y = run_dsp(&mut st, &gate, &sine(1000.0, undb(-67.0), 1.0), 0.0);
+        // Linear RMS: db() floors at −90 for display, too high to see a −110 result.
+        let t = &y[y.len() - 14_400 * AUD_CH / 3..];
+        let rms = (t.iter().map(|v| v * v).sum::<f32>() / t.len() as f32).sqrt();
+        assert!(rms < undb(-105.0), "gated rms {rms}"); // input ≈ −70 dB, −40 dB range
+        assert!(!st.gate_open);
+        // Auto-level: quiet mic (−40 dB RMS) and loud desktop (−8 dB RMS)
+        // both converge on the −20 dB target → balanced within 2 dB.
+        let lvl = AudioDsp::default();
+        let mut mic = SrcDsp::new(true);
+        let mut desk = SrcDsp::new(false);
+        let ym = run_dsp(&mut mic, &lvl, &sine(300.0, undb(-37.0), 12.0), 0.0);
+        let yd = run_dsp(&mut desk, &lvl, &sine(300.0, undb(-5.0), 12.0), 0.0);
+        let (lm, ld) = (tail_rms_db(&ym, 1.0), tail_rms_db(&yd, 1.0));
+        assert!((lm + 20.0).abs() < 2.5, "mic {lm}");
+        assert!((ld + 20.0).abs() < 2.5, "desktop {ld}");
+        assert!((lm - ld).abs() < 2.0, "balance {lm} vs {ld}");
+        // Silence is never boosted (auto-level only learns from activity).
+        let mut st = SrcDsp::new(false);
+        run_dsp(&mut st, &lvl, &vec![0.0; AUD_RATE * AUD_CH * 5], 0.0);
+        assert_eq!(st.agc_db, 0.0);
+        // Ducking: 12 dB requested → desktop ≈ 12 dB quieter.
+        let mut a = SrcDsp::new(false);
+        let mut b = SrcDsp::new(false);
+        let x = sine(500.0, 0.3, 2.0);
+        let ya = run_dsp(&mut a, &off, &x, 0.0);
+        let yb = run_dsp(&mut b, &off, &x, 12.0);
+        let d = tail_rms_db(&ya, 0.5) - tail_rms_db(&yb, 0.5);
+        assert!((d - 12.0).abs() < 0.5, "duck {d}");
+        // Mute and trim.
+        let mut st = SrcDsp::new(false);
+        let y = run_dsp(
+            &mut st,
+            &AudioDsp {
+                desk_mute: true,
+                ..off
+            },
+            &x,
+            0.0,
+        );
+        assert!(block_peak(&y[y.len() / 2..]) == 0.0);
+        // Limiter: +6 dBFS input never exceeds −1 dBFS.
+        let mut lim = Limiter { g: 1.0, gr_db: 0.0 };
+        let mut hot = sine(1000.0, 2.0, 0.2);
+        lim.run(&mut hot, true);
+        assert!(block_peak(&hot) <= undb(-1.0) + 1e-4 && lim.gr_db > 6.0);
+        // Hostile profile values are clamped.
+        let mut h = AudioDsp {
+            target_db: 50,
+            comp_ratio: 0,
+            duck_db: 999,
+            mic_trim_db: -500,
+            ..off
+        };
+        h.sanitize();
+        assert_eq!(
+            (h.target_db, h.comp_ratio, h.duck_db, h.mic_trim_db),
+            (-6, 1, 30, -30)
+        );
+    }
+
+    #[test]
+    fn audio_sources_and_migration() {
         let d = Settings {
             audio_api: "wasapi".into(),
             mic_device: "default".into(),
@@ -6068,20 +7248,59 @@ mod tests {
         let mut s = d.clone();
         migrate_audio(&mut s, false, &lin);
         assert_eq!(s.audio_api, "pulse");
-        // One pre-mixed f32le input; no amix; nothing at all without a pipe.
+        // The test-only lavfi backend is rejected without the env opt-in.
+        if std::env::var_os("LITECAST_TEST_AUDIO").is_none() {
+            let mut s = Settings {
+                audio_api: "lavfi".into(),
+                ..d.clone()
+            };
+            migrate_audio(&mut s, false, &lin);
+            assert_eq!(s.audio_api, "pulse");
+        }
         let ff = FfInfo {
             ok: true,
             major: 8,
             ..Default::default()
         };
-        let p = r"\\.\pipe\litecast-1-ab";
-        let j = encoder_args(&d, &ff, OutKind::Record, &["o.mkv".into()], Some(p)).join(" ");
-        assert!(j.contains(&format!("-f f32le -ar 48000 -ac 2 -i file:{p}")));
-        assert!(j.contains("-map 1:a") && !j.contains("amix") && !j.contains("dshow"));
+        // WASAPI: mic + loopback desktop; empty field = source off.
+        let v = audio_sources(&d, &ff);
+        assert_eq!(v.len(), 2);
+        assert!(v[0].1 && !v[1].1);
+        assert_eq!(
+            v[1].2,
+            CapSpec::Wasapi {
+                dev: "default".into(),
+                loopback: true
+            }
+        );
+        let one = Settings {
+            desktop_device: String::new(),
+            ..d.clone()
+        };
+        assert_eq!(audio_sources(&one, &ff).len(), 1);
+        // Other backends: an ffmpeg capture child decoding to f32le stdout.
+        let pa = Settings {
+            audio_api: "pulse".into(),
+            mic_device: "default".into(),
+            desktop_device: "@DEFAULT_MONITOR@".into(),
+            ..d.clone()
+        };
+        match &audio_sources(&pa, &ff)[1].2 {
+            CapSpec::Ffmpeg { args, .. } => {
+                let j = args.join(" ");
+                assert!(j.contains("-f pulse -i @DEFAULT_MONITOR@"));
+                assert!(j.ends_with("-vn -f f32le -ar 48000 -ac 2 pipe:1"));
+            }
+            o => panic!("unexpected {o:?}"),
+        }
+        let none = Settings {
+            audio_api: "none".into(),
+            ..pa.clone()
+        };
+        assert!(audio_sources(&none, &ff).is_empty());
+        // No hub → record has no audio track at all.
         let j = encoder_args(&d, &ff, OutKind::Record, &["o.mkv".into()], None).join(" ");
         assert!(!j.contains("-map 1:a") && !j.contains("-c:a"));
-        assert_eq!(native_sources(&d).len(), 2);
-        assert!(native_sources(&d)[1].2, "desktop source is loopback");
     }
 
     #[test]

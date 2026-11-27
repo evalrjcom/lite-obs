@@ -1,8 +1,8 @@
-# LiteCast Studio v1.2.0 — User & Developer Guide
+# LiteCast Studio v1.3.0 — User & Developer Guide
 
 [![CI](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml)
 
-`litecast_v1.2.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only. It drives **ffmpeg** as an external worker for capture and encoding.
+`litecast_v1.3.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only. It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
 
@@ -17,6 +17,7 @@
 | Recording | mkv (default, crash-safe), mp4 (faststart), mov, flv, ts. Never overwrites existing files |
 | Streaming | **Kick, Rumble**, Twitch, YouTube and custom RTMP/RTMPS/SRT presets. **Multistream** to up to 8 destinations from one encode, with per-destination auto-reconnect so one failing platform never drops the others |
 | Audio | Mic + desktop (system) audio, mixed. **Windows: native WASAPI capture, on by default, with no Stereo Mix needed.** Other backends: PulseAudio/PipeWire, ALSA, DirectShow, AVFoundation |
+| Audio processing | **Mic compressor + noise gate + rumble filter**, **auto-levelling** of mic and desktop to one loudness target so neither is louder than the other, optional ducking of desktop audio while you talk, master limiter. **Live VU meters** for Mic, Desktop and Master. Audio Mixer dialog (Ctrl+M) |
 | Encoders | libx264, NVENC, QuickSync, AMF, VAAPI, VideoToolbox (whichever your ffmpeg provides) |
 | Extras | PNG screenshot (F12), JSON profiles, headless `--record N` / `--stream N` modes for scheduled or cron use |
 
@@ -92,6 +93,7 @@ litecast [--profile FILE] [--record SECONDS] [--stream SECONDS] [--version] [--h
 | F12 | Screenshot |
 | Ctrl+, | Settings |
 | Ctrl+D | Stream destinations |
+| Ctrl+M | Audio Mixer (compressor, gate, levels, ducking) |
 | Ctrl+S / Ctrl+Shift+S / Ctrl+O | Save / Save As / Load profile |
 | Ctrl+Q | Quit (asks first while live; always finalises recordings) |
 
@@ -119,7 +121,34 @@ How it works and what to expect:
 - **Windows (backend `wasapi`, the default)**: LiteCast captures the default microphone and the default speakers/headphones (*loopback*, i.e. everything you hear) itself. Both fields default to `default`. **Detect devices** lists every input (`[in]`) and output (`[out]`) by name: pick one, or clear a field to turn that source off. Unplugging a device or changing the Windows default is handled automatically: the source reopens within a few seconds. A source that plays nothing records as silence, not as a gap.
 - **Upgrading from ≤ 1.1.1 on Windows**: profiles that used `dshow` with no devices (the old default, which recorded no audio) switch to `wasapi` automatically. A dshow device you had configured yourself is left unchanged.
 - **Windows, dshow backend**: still available for capture cards. Desktop audio there needs a loopback device such as *Stereo Mix* or a virtual cable.
-- With ffmpeg-side backends (pulse/alsa/dshow), mixing two inputs uses `amix`, which lowers each input's level. The native Windows mixer sums at full level, clamped to avoid wrap-around.
+- Since 1.3.0 every backend goes through LiteCast's own mixer (ffmpeg-side backends are captured by a small ffmpeg helper per source), so processing and meters work the same everywhere. `amix` is no longer used.
+### Audio mixer & VU meters (1.3.0)
+The **Audio** panel (right of Controls) shows a meter per channel, updated 20× a second:
+
+| Part of the meter | Meaning |
+|---|---|
+| Bar (green → yellow → red) | Loudness (RMS) on a −60…0 dBFS scale. Yellow from −20 dBFS, red from −9 dBFS |
+| Thin white line | Instantaneous peak |
+| Thicker tick that lingers | Peak hold (1.5 s); turns red above −1 dBFS (near clipping) |
+| Blue marker | The auto-level **target** |
+| Green dot left of the bar | Signal present (mic: gate open). No dot: silent or gated |
+| Readout | Level in dB, `GR` = compressor/limiter gain reduction, `±dB` = what auto-level is currently applying; `muted` when muted |
+
+**Audio Mixer… (Ctrl+M)**: changes apply live while the dialog is open, so you can watch the meters as you adjust. *OK* saves them to the profile, *Cancel* reverts and *Defaults* restores the factory values.
+
+| Setting | Default | What it does |
+|---|---|---|
+| Target loudness | −20 dBFS | Level both mic and desktop are steered to. This is what keeps one from being louder than the other |
+| Mic noise gate | on, −50 dB | Turns fan/keyboard hiss down 40 dB when you are not talking (200 ms hold, so word endings are kept) |
+| Mic compressor | on, −26 dB, 3:1 | Evens out loud and soft speech (soft knee, 5 ms attack, 150 ms release) |
+| Auto-level mic / desktop | on / on | Slow automatic gain, from −20 to +24 dB on the mic and −20 to +15 dB on desktop. It only adapts while there is signal, so silence and pauses are never boosted into hiss. It turns down faster (10 dB/s) than up (3 dB/s), and a sudden blast is clamped at 6 dB above the target |
+| Duck desktop under mic | 0 dB (off) | Lowers desktop audio by this much while you speak (e.g. 10–12 dB for commentary over gameplay) |
+| Trim mic / desktop | 0 dB | Manual offset after auto-level, if you want one consistently a bit louder |
+| Mute mic / desktop | off | Silence a channel without changing devices |
+| Master limiter | on | Brick-wall at −1 dBFS, so the mix never clips |
+
+The mic always passes through an 80 Hz high-pass (desk thumps, rumble). Turn auto-level off on a channel if you want to set its level purely by hand with Trim.
+
 - If a recording stops within seconds of starting, the cause is almost always a wrong audio device. Check the log, or set the backend to `none`.
 
 ---
@@ -133,6 +162,8 @@ How it works and what to expect:
 | Source shows `error:` under Transform | Read the Log panel. The source retries automatically (1 s → 10 s backoff) |
 | `lagged` counter rising | Lower canvas/FPS, use a hardware encoder, or use a faster x264 preset |
 | mp4 won't play after a crash | Use mkv (the default). It stays playable; remux later with `ffmpeg -i in.mkv -c copy out.mp4` |
+| Mic and desktop at very different levels | Ctrl+M: make sure *Auto-level* is on for both. Lower *Target* if the Master meter shows constant limiter GR |
+| Background hiss pumps between words | Lower the gate threshold (e.g. −55 dB) or raise it above the hiss level shown on the Mic meter while you are silent |
 | No audio in recordings (Windows) | Settings → Audio backend `wasapi`, with Mic and Desktop set to `default` (or a device from **Detect devices**). The log shows `[audio] mic: capturing "…"` when it works |
 | Recording stops instantly with *Error parsing options for input file pipe:0* | Your ffmpeg is newer than LiteCast ≤ 1.1.0 expected. Update to 1.1.1 or later |
 | Stream keeps reconnecting / ⟳ next to a destination | Check that destination's URL and key; the log shows the redacted ffmpeg error. Rumble keys are per-event, so generate a new one or enable a static key |
@@ -153,9 +184,11 @@ color / image ──────────────────────
                │              │
         ffmpeg encoder  ffmpeg encoder  (+ ffmpeg-native audio inputs, or ↓)
 
-Windows audio:  WASAPI mic ─▶ ring ┐
-                WASAPI loopback ─▶ ring ┴▶ mixer (48 kHz f32, 10 ms, wall-clock paced)
-                                              └▶ owner-only named pipe per output ─▶ ffmpeg -f f32le
+Audio:  mic (WASAPI / ffmpeg helper) ─▶ ring ─▶ HPF ─▶ gate ─▶ compressor ─▶ auto-level ─▶ trim ┐
+        desktop (loopback / helper)  ─▶ ring ─▶ auto-level ─▶ trim ─▶ duck (by mic VAD) ───────┴▶ sum
+        ─▶ limiter (−1 dBFS) ─▶ VU meters ─▶ local pipe per output ─▶ ffmpeg -f f32le
+        (48 kHz f32 stereo, 10 ms blocks, wall-clock paced; Windows: owner-only named pipe,
+         elsewhere: Unix socket in a private 0700 temp dir)
          (record file)   tee ─┬─ fifo ─▶ Kick (RTMPS)
                               ├─ fifo ─▶ Rumble (RTMP)
                               └─ fifo ─▶ … (≤ 8, onfail=ignore)
@@ -167,17 +200,19 @@ Windows audio:  WASAPI mic ─▶ ring ┐
 
 ### Tests
 ```bash
-DISPLAY=:0 cargo test --release   # 12 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio mixer
+DISPLAY=:0 cargo test --release   # 13 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio transport, DSP (HPF, gate, compressor, auto-level balance, ducking, limiter)
 ```
 (One test builds a default profile, which queries monitor geometry, so it needs an X display; Xvfb works.)
 
+End-to-end audio check (test-only `lavfi` backend, enabled by `LITECAST_TEST_AUDIO=1`; `LITECAST_LOG=1` echoes the log to stderr): set `"audio_api":"lavfi"`, mic `aevalsrc=0.02*sin(2*PI*300*t):s=48000` and desktop `aevalsrc=0.9*sin(2*PI*2000*t):s=48000` (33 dB apart), then `--record 14`. In the recording both tones measure about −20 dB. CI runs this as the **audio balance** step.
+
 ### CI & releases
 `.github/workflows/ci.yml` runs on every push and pull request:
-- **Linux** (Ubuntu 24.04): `cargo fmt --check`, `clippy -D warnings`, unit tests under Xvfb, a release build, and a **headless smoke test**. The smoke test records 4 s of a display + media + colour scene with `--record` and fails if the file has fewer than 60 frames. A **multistream smoke test** then runs `--stream` against two local RTMP listeners and checks that both received H.264 + AAC.
+- **Linux** (Ubuntu 24.04): `cargo fmt --check`, `clippy -D warnings`, unit tests under Xvfb, a release build, and a **headless smoke test**. The smoke test records 4 s of a display + media + colour scene with `--record` and fails if the file has fewer than 60 frames. A **multistream smoke test** then runs `--stream` against two local RTMP listeners and checks that both received H.264 + AAC. An **audio balance** test records synthetic mic and desktop tones 33 dB apart and fails unless both land within 3 dB of each other, near the −20 dB target.
 - **Windows** (latest): clippy and release build, which compiles the WASAPI and named-pipe code.
 - Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
 - **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
-  `git tag v1.1.2 && git push origin v1.1.2`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
+  `git tag v1.3.0 && git push origin v1.3.0`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
 
 ### Security model
 - Every child process is spawned with an argv list; no shell is ever invoked.
@@ -186,15 +221,18 @@ DISPLAY=:0 cargo test --release   # 12 unit tests: blending, clipping, sanitisin
 - The profile is written atomically with mode **0600** in a 0700 directory, because it contains stream keys.
 - Destination URLs are validated: scheme whitelist (`rtmp`, `rtmps`, `srt`), length caps, and rejection of `| [ ] \\ ' " < > ` { } ^` and whitespace. A crafted key cannot inject a second tee output or ffmpeg options.
 - Stream keys of every destination, URL credentials and SRT passphrases/streamids are **redacted** from the log, the UI and status text.
+- Mixed audio reaches ffmpeg over a private local channel. On Unix it is a socket in a fresh 0700 temp dir that accepts one connection and times out after 20 s.
+- The `lavfi` test backend (synthetic tones) is refused unless `LITECAST_TEST_AUDIO` is set, so a crafted profile cannot use it to run arbitrary lavfi graphs.
 - Windows native audio travels over a named pipe with a random 128-bit name. It has an owner-only DACL (plus SYSTEM), rejects remote clients, and allows exactly one instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`), so other users cannot connect and listen to the microphone.
 - **Known limitation**: the full stream URL, including the key, appears in the ffmpeg command line, which other local users can read via `ps` or `/proc`. ffmpeg offers no way to read the output URL from stdin. Use a single-user machine for streaming.
 
 ### Limits / not yet implemented
-Scene transitions (cut only), text sources, filters (chroma key, crop, colour correction), per-source audio levels/meters and media-file audio, studio mode, recording splitting, native Wayland/PipeWire capture.
+Scene transitions (cut only), text sources, filters (chroma key, crop, colour correction), per-*source* audio (media-file audio, more than one mic), EQ, studio mode, recording splitting, native Wayland/PipeWire capture.
 
 ---
 
 ## 7. Changelog
+- **1.3.0**: **audio processing and VU meters**. Mic 80 Hz high-pass, noise gate and soft-knee compressor. **Auto-level** of mic and desktop to one loudness target, so neither is louder or quieter than the other. Optional ducking of desktop under voice. Master −1 dBFS limiter. Live Mic/Desktop/Master meters with peak hold, gain-reduction and auto-gain readouts. **Audio Mixer** dialog (Ctrl+M) with live preview. All backends now use the in-app mixer, so pulse/alsa/dshow no longer lose level to `amix`. New `LITECAST_LOG=1` echoes the log to stderr.
 - **1.2.0**: **native Windows audio**. Mic and system audio (WASAPI loopback) are captured by LiteCast, mixed in-app, and fed to ffmpeg over a secure named pipe. This is on by default and needs no Stereo Mix. Silence is filled when nothing plays. Devices reopen automatically after being unplugged. Record and stream share one capture. Old empty-dshow Windows profiles migrate automatically.
 - **1.1.1**: fix recording and streaming on current ffmpeg builds (e.g. 2026 Windows builds), which failed with *Error parsing options for input file pipe:0*. `-thread_queue_size` is now passed only to ffmpeg 4.x–6.x.
 - **1.1.0**: Kick and Rumble destinations, plus Twitch/YouTube/custom presets. Multistream from one encode (tee + fifo) with per-destination reconnect and status. Silent audio track when no audio is configured. CBR for live x264. RTMPS capability check and pre-flight warnings. `--stream N` CLI flag. v1.0 single URL/key profiles migrate automatically. Rust 1.88+.
