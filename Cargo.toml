@@ -1,6 +1,6 @@
 [package]
 name = "litecast"
-version = "1.1.1"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "LiteCast Studio — lightweight OBS-style recorder / streamer (Rust + FLTK + ffmpeg)"
@@ -9,6 +9,18 @@ description = "LiteCast Studio — lightweight OBS-style recorder / streamer (Ru
 fltk = { version = "1.5" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Native audio capture (mic + system-audio loopback) on Windows only.
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.27"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+] }
 
 [profile.release]
 opt-level = 3

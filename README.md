@@ -1,8 +1,8 @@
-# LiteCast Studio v1.1.1 — User & Developer Guide
+# LiteCast Studio v1.2.0 — User & Developer Guide
 
 [![CI](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml)
 
-`litecast_v1.1.1` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
+`litecast_v1.2.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only. It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
 
@@ -16,7 +16,7 @@
 | Preview | Live preview. Click to select, drag to move, Shift-drag (or grab the red corner handle) to resize |
 | Recording | mkv (default, crash-safe), mp4 (faststart), mov, flv, ts. Never overwrites existing files |
 | Streaming | **Kick, Rumble**, Twitch, YouTube and custom RTMP/RTMPS/SRT presets. **Multistream** to up to 8 destinations from one encode, with per-destination auto-reconnect so one failing platform never drops the others |
-| Audio | Mic + desktop audio, mixed. Backends: PulseAudio/PipeWire, ALSA, DirectShow, AVFoundation |
+| Audio | Mic + desktop (system) audio, mixed. **Windows: native WASAPI capture, on by default, with no Stereo Mix needed.** Other backends: PulseAudio/PipeWire, ALSA, DirectShow, AVFoundation |
 | Encoders | libx264, NVENC, QuickSync, AMF, VAAPI, VideoToolbox (whichever your ffmpeg provides) |
 | Extras | PNG screenshot (F12), JSON profiles, headless `--record N` / `--stream N` modes for scheduled or cron use |
 
@@ -29,7 +29,7 @@
 **Runtime**
 - ffmpeg ≥ 4.4 on `PATH`, or set its path in Settings. Version 5.1 or later is recommended (uses `-fps_mode`; older builds fall back to `-vsync`).
 - Linux: an X11 session. Wayland sessions work only through XWayland, because ffmpeg's `x11grab` cannot see native Wayland windows.
-- Windows 10/11: ffmpeg built with gdigrab/dshow (gyan.dev or BtbN builds work).
+- Windows 10/11: ffmpeg built with gdigrab (gyan.dev or BtbN builds work). Audio is captured by LiteCast itself, so ffmpeg needs no audio device support.
 - macOS: ffmpeg with AVFoundation, plus Screen Recording permission granted to the terminal or app.
 
 **Build**
@@ -116,8 +116,10 @@ How it works and what to expect:
 
 ### Audio notes
 - **Linux (PulseAudio/PipeWire)**: Mic `default`, Desktop `@DEFAULT_MONITOR@`. **Detect devices** lists everything `pactl` knows about.
-- **Windows**: desktop audio needs a loopback device such as *Stereo Mix* or a virtual cable. Leave a field blank to disable it.
-- Mixing two inputs uses ffmpeg's `amix`, which lowers each input's level. Adjust gain in your OS mixer if needed.
+- **Windows (backend `wasapi`, the default)**: LiteCast captures the default microphone and the default speakers/headphones (*loopback*, i.e. everything you hear) itself. Both fields default to `default`. **Detect devices** lists every input (`[in]`) and output (`[out]`) by name: pick one, or clear a field to turn that source off. Unplugging a device or changing the Windows default is handled automatically: the source reopens within a few seconds. A source that plays nothing records as silence, not as a gap.
+- **Upgrading from ≤ 1.1.1 on Windows**: profiles that used `dshow` with no devices (the old default, which recorded no audio) switch to `wasapi` automatically. A dshow device you had configured yourself is left unchanged.
+- **Windows, dshow backend**: still available for capture cards. Desktop audio there needs a loopback device such as *Stereo Mix* or a virtual cable.
+- With ffmpeg-side backends (pulse/alsa/dshow), mixing two inputs uses `amix`, which lowers each input's level. The native Windows mixer sums at full level, clamped to avoid wrap-around.
 - If a recording stops within seconds of starting, the cause is almost always a wrong audio device. Check the log, or set the backend to `none`.
 
 ---
@@ -131,6 +133,7 @@ How it works and what to expect:
 | Source shows `error:` under Transform | Read the Log panel. The source retries automatically (1 s → 10 s backoff) |
 | `lagged` counter rising | Lower canvas/FPS, use a hardware encoder, or use a faster x264 preset |
 | mp4 won't play after a crash | Use mkv (the default). It stays playable; remux later with `ffmpeg -i in.mkv -c copy out.mp4` |
+| No audio in recordings (Windows) | Settings → Audio backend `wasapi`, with Mic and Desktop set to `default` (or a device from **Detect devices**). The log shows `[audio] mic: capturing "…"` when it works |
 | Recording stops instantly with *Error parsing options for input file pipe:0* | Your ffmpeg is newer than LiteCast ≤ 1.1.0 expected. Update to 1.1.1 or later |
 | Stream keeps reconnecting / ⟳ next to a destination | Check that destination's URL and key; the log shows the redacted ffmpeg error. Rumble keys are per-event, so generate a new one or enable a static key |
 | "ffmpeg lacks RTMPS" on Go Live | Your ffmpeg was built without TLS. Install a full build (distro ffmpeg, gyan.dev or BtbN). Kick needs RTMPS |
@@ -148,7 +151,11 @@ color / image ──────────────────────
                   │ canvas Arc (pooled)        │ RGB preview (downscaled)
           writer thread  writer thread          FLTK preview widget
                │              │
-        ffmpeg encoder  ffmpeg encoder  (+ ffmpeg-native audio inputs)
+        ffmpeg encoder  ffmpeg encoder  (+ ffmpeg-native audio inputs, or ↓)
+
+Windows audio:  WASAPI mic ─▶ ring ┐
+                WASAPI loopback ─▶ ring ┴▶ mixer (48 kHz f32, 10 ms, wall-clock paced)
+                                              └▶ owner-only named pipe per output ─▶ ffmpeg -f f32le
          (record file)   tee ─┬─ fifo ─▶ Kick (RTMPS)
                               ├─ fifo ─▶ Rumble (RTMP)
                               └─ fifo ─▶ … (≤ 8, onfail=ignore)
@@ -160,14 +167,14 @@ color / image ──────────────────────
 
 ### Tests
 ```bash
-DISPLAY=:0 cargo test --release   # 10 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight
+DISPLAY=:0 cargo test --release   # 12 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio mixer
 ```
 (One test builds a default profile, which queries monitor geometry, so it needs an X display; Xvfb works.)
 
 ### CI & releases
 `.github/workflows/ci.yml` runs on every push and pull request:
 - **Linux** (Ubuntu 24.04): `cargo fmt --check`, `clippy -D warnings`, unit tests under Xvfb, a release build, and a **headless smoke test**. The smoke test records 4 s of a display + media + colour scene with `--record` and fails if the file has fewer than 60 frames. A **multistream smoke test** then runs `--stream` against two local RTMP listeners and checks that both received H.264 + AAC.
-- **Windows** (latest): clippy and release build.
+- **Windows** (latest): clippy and release build, which compiles the WASAPI and named-pipe code.
 - Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
 - **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
   `git tag v1.1.2 && git push origin v1.1.2`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
@@ -179,14 +186,16 @@ DISPLAY=:0 cargo test --release   # 10 unit tests: blending, clipping, sanitisin
 - The profile is written atomically with mode **0600** in a 0700 directory, because it contains stream keys.
 - Destination URLs are validated: scheme whitelist (`rtmp`, `rtmps`, `srt`), length caps, and rejection of `| [ ] \\ ' " < > ` { } ^` and whitespace. A crafted key cannot inject a second tee output or ffmpeg options.
 - Stream keys of every destination, URL credentials and SRT passphrases/streamids are **redacted** from the log, the UI and status text.
+- Windows native audio travels over a named pipe with a random 128-bit name. It has an owner-only DACL (plus SYSTEM), rejects remote clients, and allows exactly one instance (`FILE_FLAG_FIRST_PIPE_INSTANCE`), so other users cannot connect and listen to the microphone.
 - **Known limitation**: the full stream URL, including the key, appears in the ffmpeg command line, which other local users can read via `ps` or `/proc`. ffmpeg offers no way to read the output URL from stdin. Use a single-user machine for streaming.
 
 ### Limits / not yet implemented
-Scene transitions (cut only), text sources, filters (chroma key, crop, colour correction), per-source audio and media audio, studio mode, recording splitting, native Wayland/PipeWire capture.
+Scene transitions (cut only), text sources, filters (chroma key, crop, colour correction), per-source audio levels/meters and media-file audio, studio mode, recording splitting, native Wayland/PipeWire capture.
 
 ---
 
 ## 7. Changelog
+- **1.2.0**: **native Windows audio**. Mic and system audio (WASAPI loopback) are captured by LiteCast, mixed in-app, and fed to ffmpeg over a secure named pipe. This is on by default and needs no Stereo Mix. Silence is filled when nothing plays. Devices reopen automatically after being unplugged. Record and stream share one capture. Old empty-dshow Windows profiles migrate automatically.
 - **1.1.1**: fix recording and streaming on current ffmpeg builds (e.g. 2026 Windows builds), which failed with *Error parsing options for input file pipe:0*. `-thread_queue_size` is now passed only to ffmpeg 4.x–6.x.
 - **1.1.0**: Kick and Rumble destinations, plus Twitch/YouTube/custom presets. Multistream from one encode (tee + fifo) with per-destination reconnect and status. Silent audio track when no audio is configured. CBR for live x264. RTMPS capability check and pre-flight warnings. `--stream N` CLI flag. v1.0 single URL/key profiles migrate automatically. Rust 1.88+.
 - **1.0.0**: initial release.

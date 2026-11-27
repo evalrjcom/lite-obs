@@ -1,5 +1,5 @@
 // =============================================================================
-//  litecast_v1.1.1 — LiteCast Studio
+//  litecast_v1.2.0 — LiteCast Studio
 //  A lightweight OBS-style recorder / live streamer in Rust + FLTK.
 //
 //  Architecture (one process, ffmpeg used as an external worker binary):
@@ -18,10 +18,14 @@
 //     record file        RTMP/SRT stream          (+ ffmpeg-native audio in)
 //
 //  Build:   cargo build --release      (needs cmake + X11 dev libs on Linux)
-//  Run:     ./litecast [--profile FILE] [--record SECONDS] [--version]
+//  Run:     ./litecast [--profile FILE] [--record SECONDS] [--stream SECONDS] [--version]
 //  Runtime: ffmpeg >= 4.4 on PATH (or set in Settings).
 //
 //  Changelog
+//   1.2.0  Native Windows audio: WASAPI mic + system-audio loopback captured
+//          in-app, mixed (silence-filled, wall-clock paced) and piped to
+//          ffmpeg over an owner-only named pipe; default on, no Stereo Mix
+//          needed. Empty-dshow Windows profiles migrate automatically.
 //   1.1.1  Fix: recording/streaming failed on current ffmpeg builds (e.g.
 //          Windows gyan/BtbN 2026) with "Error parsing options for input
 //          file pipe:0": -thread_queue_size is now output-only there, so
@@ -107,7 +111,15 @@ const X264_PRESETS: &[&str] = &[
     "medium",
 ];
 const REC_FORMATS: &[&str] = &["mkv", "mp4", "mov", "flv", "ts"];
-const AUDIO_APIS: &[&str] = &["none", "pulse", "alsa", "dshow", "avfoundation"];
+const AUDIO_APIS: &[&str] = &["none", "wasapi", "pulse", "alsa", "dshow", "avfoundation"];
+/// Backends offered on this OS (wasapi = native Windows capture).
+fn audio_apis_here() -> Vec<&'static str> {
+    AUDIO_APIS
+        .iter()
+        .copied()
+        .filter(|a| cfg!(windows) || *a != "wasapi")
+        .collect()
+}
 
 /// Internal pixel format. BGRA matches x11grab/gdigrab native order, so the
 /// capture side does no channel swizzle (only alpha fill).
@@ -240,7 +252,8 @@ impl Default for Settings {
         let videos = home_dir().join("Videos");
         let rec_dir = if videos.is_dir() { videos } else { home_dir() };
         let (api, mic, desk) = if cfg!(windows) {
-            ("dshow", "", "")
+            // Native WASAPI: default mic + system-audio loopback, no setup.
+            ("wasapi", "default", "default")
         } else if cfg!(target_os = "macos") {
             ("avfoundation", "", "")
         } else {
@@ -443,9 +456,7 @@ fn sanitize(p: &mut Profile) {
     if !REC_FORMATS.contains(&s.rec_format.as_str()) {
         s.rec_format = d.rec_format.clone();
     }
-    if !AUDIO_APIS.contains(&s.audio_api.as_str()) {
-        s.audio_api = d.audio_api.clone();
-    }
+    migrate_audio(s, cfg!(windows), &d);
     if s.ffmpeg_path.trim().is_empty() {
         s.ffmpeg_path = d.ffmpeg_path.clone();
     }
@@ -631,6 +642,22 @@ fn ffmpeg_cmd(prog: &str) -> Command {
 
 /// Force the file protocol for local paths so names like "concat:..." or
 /// "subfile,..." cannot be interpreted as ffmpeg protocols.
+/// Unknown/foreign backends fall back to the platform default. On Windows,
+/// a pre-1.2 dshow profile with no devices (which recorded *no audio at
+/// all*) is upgraded to native mic + system audio.
+fn migrate_audio(s: &mut Settings, windows: bool, d: &Settings) {
+    let ok = AUDIO_APIS.contains(&s.audio_api.as_str()) && (windows || s.audio_api != "wasapi");
+    let empty_dshow = windows
+        && s.audio_api == "dshow"
+        && s.mic_device.trim().is_empty()
+        && s.desktop_device.trim().is_empty();
+    if !ok || empty_dshow {
+        s.audio_api = d.audio_api.clone();
+        s.mic_device = d.mic_device.clone();
+        s.desktop_device = d.desktop_device.clone();
+    }
+}
+
 fn file_arg(p: &str) -> String {
     if p.contains("://") {
         p.to_string()
@@ -969,6 +996,7 @@ fn detect_audio_devices(api: &str, ff: &str) -> DevList {
             }
             v
         }
+        "wasapi" => wasapi_devices(),
         "dshow" => parse_dshow(ff).1,
         "avfoundation" => parse_avfoundation(ff).1,
         _ => vec![],
@@ -1911,8 +1939,26 @@ enum OutKind {
     Stream,
 }
 
-fn audio_inputs(s: &Settings, ff: &FfInfo) -> Vec<Vec<String>> {
+fn audio_inputs(s: &Settings, ff: &FfInfo, audio_pipe: Option<&str>) -> Vec<Vec<String>> {
     let mut v = vec![];
+    if s.audio_api == "wasapi" {
+        // One pre-mixed input (mic + loopback), fed by our AudioHub.
+        if let Some(p) = audio_pipe {
+            let q: &[&str] = if ff.input_queue_opt() {
+                &["-thread_queue_size", "1024"]
+            } else {
+                &[]
+            };
+            v.push(
+                q.iter()
+                    .chain(&["-f", "f32le", "-ar", "48000", "-ac", "2", "-i"])
+                    .map(|x| x.to_string())
+                    .chain([file_arg(p)])
+                    .collect(),
+            );
+        }
+        return v;
+    }
     for dev in [&s.mic_device, &s.desktop_device] {
         let d = dev.trim();
         if d.is_empty() || s.audio_api == "none" {
@@ -1949,7 +1995,14 @@ fn audio_inputs(s: &Settings, ff: &FfInfo) -> Vec<Vec<String>> {
 
 /// Pure function: settings -> encoder argv. Kept side-effect free for testing.
 /// `targets`: one file path for Record; one or more ingest URLs for Stream.
-fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, targets: &[String]) -> Vec<String> {
+/// `audio_pipe`: native-audio pipe path when the wasapi backend is active.
+fn encoder_args(
+    s: &Settings,
+    ff: &FfInfo,
+    kind: OutKind,
+    targets: &[String],
+    audio_pipe: Option<&str>,
+) -> Vec<String> {
     let mut a: Vec<String> = Vec::new();
     let mut p = |v: &[&str]| a.extend(v.iter().map(|x| x.to_string()));
     p(&[
@@ -1985,7 +2038,7 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, targets: &[String]) ->
         "-i",
         "pipe:0",
     ]);
-    let auds = audio_inputs(s, ff);
+    let auds = audio_inputs(s, ff, audio_pipe);
     for ai in &auds {
         a.extend(ai.iter().cloned());
     }
@@ -2128,6 +2181,536 @@ fn secrets_of(s: &Settings) -> Vec<String> {
     v
 }
 
+// ----------------------------------------------------------------------------
+// Native audio (v1.2.0): WASAPI mic + system-audio loopback on Windows
+// ----------------------------------------------------------------------------
+// Mainline ffmpeg has no WASAPI input, and dshow needs a "Stereo Mix"
+// loopback device that most PCs lack, so on Windows audio is captured
+// natively. Each capture thread fills a SrcRing; one mixer thread, paced
+// to the wall clock, sums the rings into 10 ms chunks of 48 kHz stereo f32
+// and fans them out to every running output. Each output receives them on
+// a private, owner-only named pipe that ffmpeg reads as raw f32le.
+//
+// WASAPI loopback delivers *no packets* while nothing is playing; the
+// mixer zero-fills, so ffmpeg always gets a continuous, correctly-timed
+// audio stream (sample count == wall clock) and never stalls.
+
+const AUD_RATE: usize = 48_000;
+const AUD_CH: usize = 2;
+/// 10 ms of interleaved stereo samples.
+const AUD_CHUNK: usize = AUD_RATE / 100 * AUD_CH;
+/// A ring starts (or restarts after an underrun) only once 30 ms are
+/// buffered, so capture jitter does not turn into crackle.
+const RING_PRIME: usize = AUD_CHUNK * 3;
+/// Above 250 ms the ring is trimmed back to the prime level: this bounds
+/// latency and absorbs device-clock vs wall-clock drift.
+#[cfg_attr(not(windows), allow(dead_code))]
+const RING_MAX: usize = AUD_RATE / 4 * AUD_CH;
+
+#[derive(Default)]
+struct SrcRing {
+    q: VecDeque<f32>,
+    primed: bool,
+}
+
+impl SrcRing {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn push(&mut self, s: &[f32]) {
+        self.q.extend(s);
+        if self.q.len() > RING_MAX {
+            let excess = self.q.len() - RING_PRIME;
+            self.q.drain(..excess - excess % AUD_CH); // keep L/R alignment
+        }
+    }
+}
+
+/// Sum every primed ring into `out` (zero-filled first), clamp to [-1, 1].
+/// A ring that runs dry contributes silence and must re-prime.
+fn mix_into(rings: &[Arc<Mutex<SrcRing>>], out: &mut [f32]) {
+    out.fill(0.0);
+    for r in rings {
+        let mut g = lock(r);
+        if !g.primed {
+            if g.q.len() < RING_PRIME {
+                continue;
+            }
+            g.primed = true;
+        }
+        let n = out.len().min(g.q.len());
+        for (o, s) in out.iter_mut().zip(g.q.drain(..n)) {
+            *o += s;
+        }
+        if n < out.len() {
+            g.primed = false; // underrun: wait for a fresh cushion
+        }
+    }
+    for o in out.iter_mut() {
+        *o = o.clamp(-1.0, 1.0);
+    }
+}
+
+/// Little-endian f32 PCM, as ffmpeg's `-f f32le` expects.
+fn pcm_bytes(s: &[f32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(s.len() * 4);
+    for x in s {
+        b.extend_from_slice(&x.to_le_bytes());
+    }
+    b
+}
+
+type AudioChunk = Arc<Vec<u8>>;
+
+/// Shared capture + mixer. Held by `Arc` in each output session using it;
+/// dropping the last reference stops and joins every thread.
+struct AudioHub {
+    /// Settings fingerprint, so a running hub is reused only if unchanged.
+    key: String,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+}
+
+impl AudioHub {
+    fn key_for(s: &Settings) -> String {
+        format!("{}|{}|{}", s.audio_api, s.mic_device, s.desktop_device)
+    }
+
+    /// `sources`: (label, device, loopback). Device "default" = system default.
+    fn start(key: String, sources: Vec<(String, String, bool)>, log: &Logger) -> Arc<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>> = Arc::default();
+        let mut threads = vec![];
+        let mut rings = vec![];
+        for (label, dev, loopback) in sources {
+            let ring: Arc<Mutex<SrcRing>> = Arc::default();
+            rings.push(ring.clone());
+            let (stop, log) = (stop.clone(), log.clone());
+            if let Ok(h) = thread::Builder::new()
+                .name(format!("audio-{label}"))
+                .spawn(move || capture_supervisor(label, dev, loopback, ring, stop, log))
+            {
+                threads.push(h);
+            }
+        }
+        let (stop2, subs2) = (stop.clone(), subs.clone());
+        if let Ok(h) = thread::Builder::new()
+            .name("audio-mixer".into())
+            .spawn(move || mixer_loop(rings, subs2, stop2))
+        {
+            threads.push(h);
+        }
+        Arc::new(Self {
+            key,
+            subs,
+            stop,
+            threads,
+        })
+    }
+
+    /// ~1 s of buffering per subscriber; a stalled encoder loses chunks
+    /// instead of stalling the mixer (or the other outputs).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn subscribe(&self) -> std::sync::mpsc::Receiver<AudioChunk> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(100);
+        lock(&self.subs).push(tx);
+        rx
+    }
+}
+
+impl Drop for AudioHub {
+    fn drop(&mut self) {
+        self.stop.store(true, Relaxed);
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Wall-clock-paced producer: always emits exactly AUD_RATE frames per
+/// second of real time (drift-free; catches up after scheduling hiccups).
+fn mixer_loop(
+    rings: Vec<Arc<Mutex<SrcRing>>>,
+    subs: Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>,
+    stop: Arc<AtomicBool>,
+) {
+    let t0 = Instant::now();
+    let mut chunks: u64 = 0;
+    let mut buf = vec![0f32; AUD_CHUNK];
+    while !stop.load(Relaxed) {
+        let due = t0.elapsed().as_millis() as u64 / 10;
+        if chunks >= due {
+            thread::sleep(Duration::from_millis(3));
+            continue;
+        }
+        // > 1 s behind (machine suspended?): skip ahead rather than burst.
+        if due - chunks > 100 {
+            chunks = due - 1;
+        }
+        while chunks < due {
+            mix_into(&rings, &mut buf);
+            let c: AudioChunk = Arc::new(pcm_bytes(&buf));
+            lock(&subs).retain(|tx| {
+                !matches!(
+                    tx.try_send(c.clone()),
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_))
+                )
+            });
+            chunks += 1;
+        }
+    }
+}
+
+/// Keeps one source alive: reopens after errors (device unplugged, default
+/// device changed) with backoff, until stopped.
+fn capture_supervisor(
+    label: String,
+    dev: String,
+    loopback: bool,
+    ring: Arc<Mutex<SrcRing>>,
+    stop: Arc<AtomicBool>,
+    log: Logger,
+) {
+    let mut backoff = Duration::from_secs(1);
+    while !stop.load(Relaxed) {
+        match capture_run(&label, &dev, loopback, &ring, &stop, &log) {
+            Ok(()) => break,
+            Err(e) => {
+                log.log(format!(
+                    "[audio] {label}: {e} — retrying in {}s",
+                    backoff.as_secs()
+                ));
+                sleep_interruptible(backoff, &stop);
+                backoff = (backoff * 2).min(Duration::from_secs(10));
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn capture_run(
+    _label: &str,
+    _dev: &str,
+    _loopback: bool,
+    _ring: &Arc<Mutex<SrcRing>>,
+    _stop: &AtomicBool,
+    _log: &Logger,
+) -> Result<(), String> {
+    Err("native audio capture is only available on Windows".into())
+}
+
+#[cfg(windows)]
+fn capture_run(
+    label: &str,
+    dev: &str,
+    loopback: bool,
+    ring: &Arc<Mutex<SrcRing>>,
+    stop: &AtomicBool,
+    log: &Logger,
+) -> Result<(), String> {
+    use wasapi::{DeviceEnumerator, Direction, SampleType, StreamMode, WaveFormat};
+    let e = |x: wasapi::WasapiError| x.to_string();
+    let _ = wasapi::initialize_mta(); // per thread; S_FALSE if already done
+    let en = DeviceEnumerator::new().map_err(e)?;
+    // Loopback = open the *render* endpoint, initialise it for capture.
+    let dir = if loopback {
+        Direction::Render
+    } else {
+        Direction::Capture
+    };
+    let device = if dev.eq_ignore_ascii_case("default") {
+        en.get_default_device(dir).map_err(e)?
+    } else {
+        let coll = en.get_device_collection(dir).map_err(e)?;
+        let mut found = None;
+        for d in &coll {
+            let d = d.map_err(e)?;
+            if d.get_friendlyname().map(|n| n == dev).unwrap_or(false) {
+                found = Some(d);
+                break;
+            }
+        }
+        found.ok_or_else(|| format!("device \"{dev}\" not found"))?
+    };
+    let name = device
+        .get_friendlyname()
+        .unwrap_or_else(|_| dev.to_string());
+    let mut client = device.get_iaudioclient().map_err(e)?;
+    // Shared mode + autoconvert: Windows resamples to 48 kHz stereo f32.
+    let fmt = WaveFormat::new(32, 32, SampleType::Float, AUD_RATE, AUD_CH, None);
+    let mode = StreamMode::PollingShared {
+        autoconvert: true,
+        buffer_duration_hns: 1_000_000, // 100 ms device buffer
+    };
+    client
+        .initialize_client(&fmt, Direction::Capture, mode, None)
+        .map_err(e)?;
+    let cap = client.get_audiocaptureclient().map_err(e)?;
+    client.start_stream().map_err(e)?;
+    log.log(format!(
+        "[audio] {label}: capturing \"{name}\"{}",
+        if loopback { " (loopback)" } else { "" }
+    ));
+    let mut bytes: VecDeque<u8> = VecDeque::with_capacity(64 * 1024);
+    let mut samples: Vec<f32> = Vec::with_capacity(16 * 1024);
+    let res = loop {
+        if stop.load(Relaxed) {
+            break Ok(());
+        }
+        thread::sleep(Duration::from_millis(5));
+        let mut err = None;
+        loop {
+            match cap.get_next_packet_size() {
+                Ok(Some(n)) if n > 0 => {
+                    if let Err(x) = cap.read_from_device_to_deque(&mut bytes) {
+                        err = Some(e(x));
+                        break;
+                    }
+                }
+                Ok(_) => break,
+                Err(x) => {
+                    err = Some(e(x));
+                    break;
+                }
+            }
+        }
+        if let Some(x) = err {
+            break Err(x);
+        }
+        if bytes.len() >= 4 {
+            let n = bytes.len() / 4 * 4;
+            samples.clear();
+            let (a, b) = bytes.as_slices();
+            let mut it = a.iter().chain(b.iter()).take(n).copied();
+            while let (Some(b0), Some(b1), Some(b2), Some(b3)) =
+                (it.next(), it.next(), it.next(), it.next())
+            {
+                samples.push(f32::from_le_bytes([b0, b1, b2, b3]));
+            }
+            bytes.drain(..n);
+            lock(ring).push(&samples);
+        }
+    };
+    let _ = client.stop_stream();
+    res
+}
+
+/// Random, unguessable pipe name (no RNG crate: OS-seeded SipHash keys).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pipe_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let part = || {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        h.finish()
+    };
+    format!(
+        r"\\.\pipe\litecast-{}-{:016x}{:016x}",
+        std::process::id(),
+        part(),
+        part()
+    )
+}
+
+/// Server end of the per-output audio pipe. Created *before* ffmpeg starts
+/// so its input open succeeds immediately.
+#[cfg(windows)]
+struct AudioPipe {
+    name: String,
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+unsafe impl Send for AudioPipe {}
+
+#[cfg(windows)]
+impl AudioPipe {
+    fn create() -> Result<Self, String> {
+        use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_OUTBOUND,
+        };
+        use windows_sys::Win32::System::Pipes::{
+            CreateNamedPipeW, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
+        };
+        let name = pipe_name();
+        let wname: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // Owner-only DACL: other local users cannot connect and read the mic.
+        let sddl: Vec<u16> = "D:P(A;;GA;;;OW)(A;;GA;;;SY)"
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: valid NUL-terminated wide strings and out-pointers; the
+        // descriptor is freed with LocalFree below as the API requires.
+        unsafe {
+            if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return Err(format!(
+                    "security descriptor: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            let h = CreateNamedPipeW(
+                wname.as_ptr(),
+                PIPE_ACCESS_OUTBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                PIPE_TYPE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                1,          // exactly one client: the encoder
+                256 * 1024, // ~0.7 s of audio
+                0,
+                0,
+                &sa,
+            );
+            let err = std::io::Error::last_os_error();
+            LocalFree(sd as _);
+            if h == INVALID_HANDLE_VALUE || h.is_null() {
+                return Err(format!("CreateNamedPipe: {err}"));
+            }
+            Ok(Self { name, handle: h })
+        }
+    }
+
+    /// Unblock a ConnectNamedPipe that will never be satisfied (ffmpeg died
+    /// before opening its input) by connecting to ourselves once.
+    fn poke(name: &str) {
+        use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_READ, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{CreateFileW, OPEN_EXISTING};
+        let w: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: plain CreateFile/CloseHandle on a NUL-terminated name.
+        unsafe {
+            let h = CreateFileW(
+                w.as_ptr(),
+                GENERIC_READ,
+                0,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                std::ptr::null_mut(),
+            );
+            if h != INVALID_HANDLE_VALUE {
+                CloseHandle(h);
+            }
+        }
+    }
+
+    /// Wait for ffmpeg, then stream mixed audio until stop or ffmpeg exits.
+    /// Closing the handle on return gives ffmpeg a clean EOF, so it can
+    /// finalise the file.
+    fn serve(self, rx: std::sync::mpsc::Receiver<AudioChunk>, stop: Arc<AtomicBool>) {
+        use windows_sys::Win32::Foundation::{ERROR_PIPE_CONNECTED, GetLastError};
+        use windows_sys::Win32::Storage::FileSystem::WriteFile;
+        use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+        // SAFETY: handle is a valid pipe owned by self for the whole call.
+        let connected = unsafe {
+            ConnectNamedPipe(self.handle, std::ptr::null_mut()) != 0
+                || GetLastError() == ERROR_PIPE_CONNECTED
+        };
+        if !connected || stop.load(Relaxed) {
+            return;
+        }
+        while !stop.load(Relaxed) {
+            let c = match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(c) => c,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => break,
+            };
+            let mut off = 0;
+            while off < c.len() {
+                let mut n = 0u32;
+                // SAFETY: in-bounds slice pointer/length; synchronous write.
+                let ok = unsafe {
+                    WriteFile(
+                        self.handle,
+                        c[off..].as_ptr(),
+                        (c.len() - off) as u32,
+                        &mut n,
+                        std::ptr::null_mut(),
+                    )
+                };
+                if ok == 0 || n == 0 {
+                    return; // ffmpeg closed its end
+                }
+                off += n as usize;
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for AudioPipe {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle; closed exactly once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Settings → capture sources for the native backend.
+fn native_sources(s: &Settings) -> Vec<(String, String, bool)> {
+    let mut v = vec![];
+    if !s.mic_device.trim().is_empty() {
+        v.push(("mic".into(), s.mic_device.trim().to_string(), false));
+    }
+    if !s.desktop_device.trim().is_empty() {
+        v.push(("desktop".into(), s.desktop_device.trim().to_string(), true));
+    }
+    v
+}
+
+/// Runs on its own thread: initialising COM as MTA on the FLTK UI thread
+/// would break its native (STA/OLE) file dialogs.
+#[cfg(windows)]
+fn wasapi_devices() -> DevList {
+    thread::spawn(wasapi_devices_mta).join().unwrap_or_default()
+}
+
+#[cfg(windows)]
+fn wasapi_devices_mta() -> DevList {
+    use wasapi::{DeviceEnumerator, Direction};
+    let _ = wasapi::initialize_mta();
+    let mut v: DevList = vec![
+        ("default".into(), "default — microphone / speakers".into()),
+        (String::new(), "(off)".into()),
+    ];
+    if let Ok(en) = DeviceEnumerator::new() {
+        for (dir, tag) in [(Direction::Capture, "in"), (Direction::Render, "out")] {
+            if let Ok(coll) = en.get_device_collection(dir) {
+                for d in (&coll).into_iter().flatten() {
+                    if let Ok(n) = d.get_friendlyname() {
+                        v.push((n.clone(), format!("[{tag}] {n}")));
+                    }
+                }
+            }
+        }
+    }
+    v
+}
+
+#[cfg(not(windows))]
+fn wasapi_devices() -> DevList {
+    vec![]
+}
+
 struct OutputSession {
     kind: OutKind,
     child: Arc<Mutex<Option<Child>>>,
@@ -2141,9 +2724,15 @@ struct OutputSession {
     label: String,
     /// Stream only: (name, url, last error time) per destination.
     health: DestHealth,
+    /// Native audio: pipe-feeding thread, its pipe name, and the hub.
+    audio_writer: Option<JoinHandle<()>>,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    audio_pipe: Option<String>,
+    _hub: Option<Arc<AudioHub>>,
 }
 
 impl OutputSession {
+    #[allow(clippy::too_many_arguments)] // one call site per output kind
     fn start(
         kind: OutKind,
         s: &Settings,
@@ -2152,9 +2741,20 @@ impl OutputSession {
         log: &Logger,
         targets: &[(String, String)], // (display name, path or ingest URL)
         label: String,
+        hub: Option<Arc<AudioHub>>,
     ) -> Result<Self, String> {
         let urls: Vec<String> = targets.iter().map(|t| t.1.clone()).collect();
-        let args = encoder_args(s, ff, kind, &urls);
+        // The pipe must exist before ffmpeg opens its inputs.
+        #[cfg(windows)]
+        let pipe = match &hub {
+            Some(_) => Some(AudioPipe::create()?),
+            None => None,
+        };
+        #[cfg(windows)]
+        let pipe_name: Option<String> = pipe.as_ref().map(|p| p.name.clone());
+        #[cfg(not(windows))]
+        let pipe_name: Option<String> = None;
+        let args = encoder_args(s, ff, kind, &urls, pipe_name.as_deref());
         let mut cmd = ffmpeg_cmd(&s.ffmpeg_path);
         cmd.args(&args)
             .stdin(Stdio::piped())
@@ -2203,6 +2803,9 @@ impl OutputSession {
             last_err,
             label,
             health,
+            audio_writer: None,
+            audio_pipe: pipe_name,
+            _hub: hub.clone(),
         };
         let (stop, dead, frames, comp2, log2) = (
             sess.stop.clone(),
@@ -2218,6 +2821,14 @@ impl OutputSession {
                 .spawn(move || writer_loop(stdin, comp2, stop, dead, frames, log2, tag))
                 .map_err(|e| e.to_string())?,
         );
+        #[cfg(windows)]
+        if let (Some(p), Some(h)) = (pipe, &hub) {
+            let (rx, stop) = (h.subscribe(), sess.stop.clone());
+            sess.audio_writer = thread::Builder::new()
+                .name(format!("audio-{tag}"))
+                .spawn(move || p.serve(rx, stop))
+                .ok();
+        }
         log.log(format!("[{tag}] started → {}", sess.label));
         Ok(sess)
     }
@@ -2269,6 +2880,21 @@ impl OutputSession {
                         let _ = c.kill(); // writer blocked on a stalled encoder
                     }
                     let _ = w.join();
+                }
+                // Audio pipe: exits within 200 ms of `stop`; if ffmpeg never
+                // opened it, ConnectNamedPipe is still blocked — poke it.
+                if let Some(a) = self.audio_writer.take() {
+                    let t = Instant::now();
+                    while !a.is_finished() && t.elapsed() < Duration::from_secs(2) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    #[cfg(windows)]
+                    if !a.is_finished()
+                        && let Some(n) = &self.audio_pipe
+                    {
+                        AudioPipe::poke(n);
+                    }
+                    let _ = a.join();
                 }
                 let mut graceful = false;
                 if let Some(mut c) = lock(&self.child).take() {
@@ -3595,13 +4221,9 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
     );
     let dests = Rc::new(RefCell::new(cur.destinations.clone()));
     dest_txt.set_label(&label_escape(&dest_summary(&dests.borrow())));
-    api.add_choice(&AUDIO_APIS.join("|"));
-    api.set_value(
-        AUDIO_APIS
-            .iter()
-            .position(|p| *p == cur.audio_api)
-            .unwrap_or(0) as i32,
-    );
+    let apis = audio_apis_here();
+    api.add_choice(&apis.join("|"));
+    api.set_value(apis.iter().position(|p| *p == cur.audio_api).unwrap_or(0) as i32);
     mic.set_value(&cur.mic_device);
     desk.set_value(&cur.desktop_device);
     ffp.set_value(&cur.ffmpeg_path);
@@ -3645,7 +4267,7 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
         let (api, ffp, devs) = (api.clone(), ffp.clone(), devs.clone());
         let (mut mp, mut dp) = (mic_pick.clone(), desk_pick.clone());
         detect_btn.set_callback(move |_| {
-            let a = AUDIO_APIS
+            let a = audio_apis_here()
                 .get(api.value().max(0) as usize)
                 .copied()
                 .unwrap_or("none");
@@ -3729,9 +4351,10 @@ fn settings_dialog(cur: &Settings, ff: &FfInfo) -> Option<Settings> {
             .get(fmt.value().max(0) as usize)
             .unwrap_or(&"mkv")
             .to_string();
-        s.audio_api = AUDIO_APIS
+        s.audio_api = apis
             .get(api.value().max(0) as usize)
-            .unwrap_or(&"none")
+            .copied()
+            .unwrap_or("none")
             .to_string();
         s.rec_dir = recdir.value().trim().to_string();
         s.destinations = dests.borrow().clone();
@@ -3786,6 +4409,8 @@ struct AppState {
     auto_stream: Option<(Instant, Duration)>,
     auto_stream_stop: Option<Instant>,
     rec_path: Option<PathBuf>,
+    /// Shared native-audio hub; alive while any output holds it.
+    audio_hub: std::sync::Weak<AudioHub>,
 }
 
 impl AppState {
@@ -4046,6 +4671,28 @@ impl AppState {
     }
 
     // --- outputs -------------------------------------------------------------
+    /// Native audio hub for a new output: reuse the running one when the
+    /// audio settings are unchanged (record + stream share one capture).
+    fn audio_hub(&mut self) -> Option<Arc<AudioHub>> {
+        let s = &self.prof.settings;
+        if !cfg!(windows) || s.audio_api != "wasapi" {
+            return None;
+        }
+        let src = native_sources(s);
+        if src.is_empty() {
+            return None;
+        }
+        let key = AudioHub::key_for(s);
+        if let Some(h) = self.audio_hub.upgrade()
+            && h.key == key
+        {
+            return Some(h);
+        }
+        let h = AudioHub::start(key, src, &self.log);
+        self.audio_hub = Arc::downgrade(&h);
+        Some(h)
+    }
+
     fn start_record(&mut self) -> Result<(), String> {
         let comp = self.comp.as_ref().ok_or("pipeline not running")?.sh.clone();
         let s = self.prof.settings.clone();
@@ -4053,6 +4700,7 @@ impl AppState {
         fs::create_dir_all(&dir).map_err(|e| format!("recording folder {}: {e}", dir.display()))?;
         let path = unique_path(&dir, &format!("litecast_{}", utc_stamp()), &s.rec_format);
         let p = path.to_string_lossy().into_owned();
+        let hub = self.audio_hub();
         let sess = OutputSession::start(
             OutKind::Record,
             &s,
@@ -4061,6 +4709,7 @@ impl AppState {
             &self.log,
             &[("file".to_string(), p.clone())],
             p.clone(),
+            hub,
         )?;
         self.rec = Some(sess);
         self.rec_path = Some(path);
@@ -4086,6 +4735,7 @@ impl AppState {
         }
         let names: Vec<&str> = targets.iter().map(|t| t.0.as_str()).collect();
         let label = format!("{} (keys hidden)", names.join(", "));
+        let hub = self.audio_hub();
         self.stream = Some(OutputSession::start(
             OutKind::Stream,
             &s,
@@ -4094,6 +4744,7 @@ impl AppState {
             &self.log,
             &targets,
             label,
+            hub,
         )?);
         Ok(())
     }
@@ -5067,6 +5718,7 @@ fn main() {
         auto_record_stop: None,
         auto_stream: auto_stream.map(|d| (Instant::now() + Duration::from_millis(1500), d)),
         auto_stream_stop: None,
+        audio_hub: std::sync::Weak::new(),
         rec_path: None,
     };
     st.log_ff();
@@ -5291,7 +5943,7 @@ mod tests {
             minor: 1,
             ..Default::default()
         };
-        let a = encoder_args(&s, &ff, OutKind::Record, &["/tmp/x.mkv".into()]);
+        let a = encoder_args(&s, &ff, OutKind::Record, &["/tmp/x.mkv".into()], None);
         let j = a.join(" ");
         assert!(j.contains("-f rawvideo -pix_fmt bgra"));
         assert!(j.contains("amix=inputs=2"));
@@ -5312,6 +5964,7 @@ mod tests {
                 },
                 OutKind::Record,
                 &["/tmp/x.mkv".into()],
+                None,
             )
             .join(" ");
             assert!(!j.contains("thread_queue_size"), "major {major}");
@@ -5327,6 +5980,7 @@ mod tests {
             },
             OutKind::Stream,
             &["rtmps://k/app/key1".into(), "srt://h:1?streamid=x".into()],
+            None,
         );
         let j = a.join(" ");
         assert!(
@@ -5340,6 +5994,94 @@ mod tests {
             a.last().unwrap(),
             "[f=flv:flvflags=no_duration_filesize:onfail=ignore]rtmps://k/app/key1|[f=mpegts:onfail=ignore]srt://h:1?streamid=x"
         );
+    }
+
+    #[test]
+    fn native_audio_mixer() {
+        let ring = |v: &[f32]| {
+            let r: Arc<Mutex<SrcRing>> = Arc::default();
+            lock(&r).push(v);
+            r
+        };
+        // Not yet primed (< 30 ms) -> silence, samples kept for later.
+        let short = ring(&vec![0.5; AUD_CHUNK]);
+        let mut out = vec![1.0f32; AUD_CHUNK];
+        mix_into(std::slice::from_ref(&short), &mut out);
+        assert!(out.iter().all(|&x| x == 0.0));
+        assert_eq!(lock(&short).q.len(), AUD_CHUNK);
+        // Two primed sources sum and clamp; empty loopback = silence.
+        let mic = ring(&vec![0.25; RING_PRIME]);
+        let desk = ring(&vec![0.9; RING_PRIME]);
+        let idle: Arc<Mutex<SrcRing>> = Arc::default();
+        mix_into(&[mic.clone(), desk.clone(), idle], &mut out);
+        assert!(out.iter().all(|&x| x == 1.0)); // 0.25 + 0.9 clamped
+        assert_eq!(lock(&mic).q.len(), RING_PRIME - AUD_CHUNK);
+        // Underrun: partial chunk zero-padded, ring must re-prime.
+        let thin = ring(&vec![0.1; RING_PRIME]);
+        lock(&thin).primed = true;
+        lock(&thin).q.truncate(AUD_CHUNK / 2);
+        mix_into(std::slice::from_ref(&thin), &mut out);
+        assert_eq!(out[0], 0.1);
+        assert_eq!(out[AUD_CHUNK - 1], 0.0);
+        assert!(!lock(&thin).primed);
+        // Overflow trims back to the prime level, keeping L/R alignment.
+        let big = ring(&vec![0.0; RING_MAX + 1001]);
+        assert_eq!(lock(&big).q.len() % AUD_CH, (RING_MAX + 1001) % AUD_CH);
+        assert!(lock(&big).q.len() <= RING_PRIME + 1);
+        assert_eq!(pcm_bytes(&[1.0, -0.5]), [0, 0, 128, 63, 0, 0, 0, 191]);
+        assert!(pipe_name().starts_with(r"\\.\pipe\litecast-"));
+        assert_ne!(pipe_name(), pipe_name());
+    }
+
+    #[test]
+    fn native_audio_settings_and_args() {
+        let d = Settings {
+            audio_api: "wasapi".into(),
+            mic_device: "default".into(),
+            desktop_device: "default".into(),
+            ..Settings::default()
+        };
+        // Pre-1.2 Windows profile with empty dshow devices -> native audio.
+        let mut s = Settings {
+            audio_api: "dshow".into(),
+            mic_device: String::new(),
+            desktop_device: String::new(),
+            ..d.clone()
+        };
+        migrate_audio(&mut s, true, &d);
+        assert_eq!(
+            (s.audio_api.as_str(), s.mic_device.as_str()),
+            ("wasapi", "default")
+        );
+        // A configured dshow device is left alone; wasapi is invalid off Windows.
+        let mut s = Settings {
+            audio_api: "dshow".into(),
+            mic_device: "Mic (USB)".into(),
+            ..d.clone()
+        };
+        migrate_audio(&mut s, true, &d);
+        assert_eq!(s.audio_api, "dshow");
+        let lin = Settings {
+            audio_api: "pulse".into(),
+            ..d.clone()
+        };
+        let mut s = d.clone();
+        migrate_audio(&mut s, false, &lin);
+        assert_eq!(s.audio_api, "pulse");
+        // One pre-mixed f32le input; no amix; nothing at all without a pipe.
+        let ff = FfInfo {
+            ok: true,
+            major: 8,
+            ..Default::default()
+        };
+        let p = r"\\.\pipe\litecast-1-ab";
+        let j = encoder_args(&d, &ff, OutKind::Record, &["o.mkv".into()], Some(p)).join(" ");
+        assert!(j.contains(&format!("-f f32le -ar 48000 -ac 2 -i file:{p}")));
+        assert!(j.contains("-map 1:a") && !j.contains("amix") && !j.contains("dshow"));
+        let j = encoder_args(&d, &ff, OutKind::Record, &["o.mkv".into()], None).join(" ");
+        assert!(!j.contains("-map 1:a") && !j.contains("-c:a"));
+        assert_eq!(native_sources(&d).len(), 2);
+        assert!(native_sources(&d)[1].2, "desktop source is loopback");
     }
 
     #[test]
