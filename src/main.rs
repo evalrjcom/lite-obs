@@ -2361,7 +2361,7 @@ impl SrcDsp {
         // 1. High-pass (mic): rumble/handling noise would otherwise drive the
         //    compressor and auto-level.
         if mic {
-            for f in b.chunks_exact_mut(AUD_CH) {
+            for f in b.as_chunks_mut::<AUD_CH>().0 {
                 f[0] = self.hp[0].run(f[0]);
                 f[1] = self.hp[1].run(f[1]);
             }
@@ -2387,7 +2387,7 @@ impl SrcDsp {
             } else {
                 coef(120.0)
             };
-            for f in b.chunks_exact_mut(AUD_CH) {
+            for f in b.as_chunks_mut::<AUD_CH>().0 {
                 self.gate_gain += (target - self.gate_gain) * c;
                 f[0] *= self.gate_gain;
                 f[1] *= self.gate_gain;
@@ -2402,7 +2402,7 @@ impl SrcDsp {
             let (thr, r, knee) = (p.comp_db as f32, p.comp_ratio.max(1) as f32, 6.0f32);
             let slope = 1.0 - 1.0 / r;
             let (ca, cr) = (coef(5.0), coef(150.0));
-            for f in b.chunks_exact_mut(AUD_CH) {
+            for f in b.as_chunks_mut::<AUD_CH>().0 {
                 let x = db(f[0].abs().max(f[1].abs()));
                 let over = x - thr;
                 let gr = if over <= -knee / 2.0 {
@@ -2474,7 +2474,7 @@ impl SrcDsp {
             undb(self.agc_db + trim as f32 - self.duck_db)
         };
         let (g0, n) = (self.gain, (b.len() / AUD_CH) as f32);
-        for (i, f) in b.chunks_exact_mut(AUD_CH).enumerate() {
+        for (i, f) in b.as_chunks_mut::<AUD_CH>().0.iter_mut().enumerate() {
             let g = g0 + (g1 - g0) * (i as f32 + 1.0) / n;
             f[0] *= g;
             f[1] *= g;
@@ -2517,7 +2517,7 @@ impl Limiter {
         let ceil = undb(-1.0);
         let rel = coef(100.0);
         let mut min_g = 1.0f32;
-        for f in b.chunks_exact_mut(AUD_CH) {
+        for f in b.as_chunks_mut::<AUD_CH>().0 {
             if on {
                 let pk = f[0].abs().max(f[1].abs());
                 if pk * self.g > ceil {
@@ -2862,8 +2862,10 @@ fn capture_ffmpeg(
         samples.clear();
         samples.extend(
             carry[..whole]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c)),
         );
         carry.drain(..whole);
         lock(ring).push(&samples);
