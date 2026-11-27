@@ -1,5 +1,5 @@
 // =============================================================================
-//  litecast_v1.1.0 — LiteCast Studio
+//  litecast_v1.1.1 — LiteCast Studio
 //  A lightweight OBS-style recorder / live streamer in Rust + FLTK.
 //
 //  Architecture (one process, ffmpeg used as an external worker binary):
@@ -22,6 +22,11 @@
 //  Runtime: ffmpeg >= 4.4 on PATH (or set in Settings).
 //
 //  Changelog
+//   1.1.1  Fix: recording/streaming failed on current ffmpeg builds (e.g.
+//          Windows gyan/BtbN 2026) with "Error parsing options for input
+//          file pipe:0": -thread_queue_size is now output-only there, so
+//          it is only passed to ffmpeg 4.x-6.x. Date-versioned git builds
+//          are detected as newest.
 //   1.1.0  Kick + Rumble (+ Twitch/YouTube/custom) stream destinations with
 //          presets; multistream to all enabled destinations from ONE encode
 //          (tee + fifo) with per-destination auto-reconnect; silent audio
@@ -647,6 +652,13 @@ impl FfInfo {
     fn has_fps_mode(&self) -> bool {
         self.major > 5 || (self.major == 5 && self.minor >= 1)
     }
+    /// `-thread_queue_size` as an *input* option: effective in 4.x-6.x,
+    /// silently ignored in 7.x, and rejected outright by current builds
+    /// (now output/muxer-only), which aborts the encoder. Emit it only
+    /// where it still helps device inputs.
+    fn input_queue_opt(&self) -> bool {
+        (4..=6).contains(&self.major)
+    }
 }
 
 /// Run a short-lived tool with bounded output, optional stdin, timeout and
@@ -741,9 +753,10 @@ fn detect_ffmpeg(prog: &str) -> FfInfo {
         let maj = it.next().and_then(|v| v.parse().ok());
         let min = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
         // Git builds ("N-12345-g...") are always newer than any release.
+        // Date-versioned git builds (gyan.dev "2026-11-20-git-...") likewise.
         (fi.major, fi.minor) = match maj {
-            Some(m) => (m, min),
-            None => (99, 0),
+            Some(m) if m < 1000 => (m, min),
+            _ => (99, 0),
         };
         fi.ok = true;
     }
@@ -1898,14 +1911,18 @@ enum OutKind {
     Stream,
 }
 
-fn audio_inputs(s: &Settings) -> Vec<Vec<String>> {
+fn audio_inputs(s: &Settings, ff: &FfInfo) -> Vec<Vec<String>> {
     let mut v = vec![];
     for dev in [&s.mic_device, &s.desktop_device] {
         let d = dev.trim();
         if d.is_empty() || s.audio_api == "none" {
             continue;
         }
-        let mut a: Vec<String> = vec!["-thread_queue_size".into(), "1024".into()];
+        let mut a: Vec<String> = if ff.input_queue_opt() {
+            vec!["-thread_queue_size".into(), "1024".into()]
+        } else {
+            Vec::new()
+        };
         match s.audio_api.as_str() {
             "pulse" => a.extend(["-f".into(), "pulse".into(), "-i".into(), d.into()]),
             "alsa" => a.extend(["-f".into(), "alsa".into(), "-i".into(), d.into()]),
@@ -1951,9 +1968,10 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, targets: &[String]) ->
     }
     let size = format!("{}x{}", s.canvas_w, s.canvas_h);
     let fps = s.fps.to_string();
+    if ff.input_queue_opt() {
+        p(&["-thread_queue_size", "64"]);
+    }
     p(&[
-        "-thread_queue_size",
-        "64",
         "-use_wallclock_as_timestamps",
         "1",
         "-f",
@@ -1967,7 +1985,7 @@ fn encoder_args(s: &Settings, ff: &FfInfo, kind: OutKind, targets: &[String]) ->
         "-i",
         "pipe:0",
     ]);
-    let auds = audio_inputs(s);
+    let auds = audio_inputs(s, ff);
     for ai in &auds {
         a.extend(ai.iter().cloned());
     }
@@ -5281,12 +5299,32 @@ mod tests {
         assert!(j.contains("-fps_mode cfr"));
         assert!(!j.contains("nal-hrd") && !j.contains("anullsrc"));
         assert!(a.last().unwrap() == "file:/tmp/x.mkv");
+        // ffmpeg 4-6: input queue option on the pipe and both audio devices.
+        assert_eq!(j.matches("-thread_queue_size").count(), 3);
+        // 7.x ignores it; current/git builds reject it on inputs (Windows
+        // "Error parsing options for input file pipe:0") -> never emitted.
+        for major in [7, 8, 99] {
+            let j = encoder_args(
+                &s,
+                &FfInfo {
+                    major,
+                    ..ff.clone()
+                },
+                OutKind::Record,
+                &["/tmp/x.mkv".into()],
+            )
+            .join(" ");
+            assert!(!j.contains("thread_queue_size"), "major {major}");
+        }
 
         // Stream, no audio, two destinations: silent track + tee/fifo fan-out.
         s.audio_api = "none".into();
         let a = encoder_args(
             &s,
-            &FfInfo { major: 4, ..ff },
+            &FfInfo {
+                major: 4,
+                ..ff.clone()
+            },
             OutKind::Stream,
             &["rtmps://k/app/key1".into(), "srt://h:1?streamid=x".into()],
         );

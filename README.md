@@ -1,8 +1,8 @@
-# LiteCast Studio v1.1.0 — User & Developer Guide
+# LiteCast Studio v1.1.1 — User & Developer Guide
 
 [![CI](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml)
 
-`litecast_v1.1.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
+`litecast_v1.1.1` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`). It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
 
@@ -131,6 +131,7 @@ How it works and what to expect:
 | Source shows `error:` under Transform | Read the Log panel. The source retries automatically (1 s → 10 s backoff) |
 | `lagged` counter rising | Lower canvas/FPS, use a hardware encoder, or use a faster x264 preset |
 | mp4 won't play after a crash | Use mkv (the default). It stays playable; remux later with `ffmpeg -i in.mkv -c copy out.mp4` |
+| Recording stops instantly with *Error parsing options for input file pipe:0* | Your ffmpeg is newer than LiteCast ≤ 1.1.0 expected. Update to 1.1.1 or later |
 | Stream keeps reconnecting / ⟳ next to a destination | Check that destination's URL and key; the log shows the redacted ffmpeg error. Rumble keys are per-event, so generate a new one or enable a static key |
 | "ffmpeg lacks RTMPS" on Go Live | Your ffmpeg was built without TLS. Install a full build (distro ffmpeg, gyan.dev or BtbN). Kick needs RTMPS |
 
@@ -169,7 +170,7 @@ DISPLAY=:0 cargo test --release   # 10 unit tests: blending, clipping, sanitisin
 - **Windows** (latest): clippy and release build.
 - Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
 - **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
-  `git tag v1.1.1 && git push origin v1.1.1`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
+  `git tag v1.1.2 && git push origin v1.1.2`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
 
 ### Security model
 - Every child process is spawned with an argv list; no shell is ever invoked.
@@ -186,5 +187,6 @@ Scene transitions (cut only), text sources, filters (chroma key, crop, colour co
 ---
 
 ## 7. Changelog
+- **1.1.1**: fix recording and streaming on current ffmpeg builds (e.g. 2026 Windows builds), which failed with *Error parsing options for input file pipe:0*. `-thread_queue_size` is now passed only to ffmpeg 4.x–6.x.
 - **1.1.0**: Kick and Rumble destinations, plus Twitch/YouTube/custom presets. Multistream from one encode (tee + fifo) with per-destination reconnect and status. Silent audio track when no audio is configured. CBR for live x264. RTMPS capability check and pre-flight warnings. `--stream N` CLI flag. v1.0 single URL/key profiles migrate automatically. Rust 1.88+.
 - **1.0.0**: initial release.
