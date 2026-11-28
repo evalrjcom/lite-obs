@@ -1,8 +1,8 @@
-# LiteCast Studio v1.3.0 — User & Developer Guide
+# LiteCast Studio v1.3.1 — User & Developer Guide
 
 [![CI](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml)
 
-`litecast_v1.3.0` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only. It drives **ffmpeg** as an external worker for capture and encoding.
+`litecast_v1.3.1` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only. It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
 
@@ -200,7 +200,7 @@ Audio:  mic (WASAPI / ffmpeg helper) ─▶ ring ─▶ HPF ─▶ gate ─▶ c
 
 ### Tests
 ```bash
-DISPLAY=:0 cargo test --release   # 13 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio transport, DSP (HPF, gate, compressor, auto-level balance, ducking, limiter)
+DISPLAY=:0 cargo test --release   # 14 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio transport (incl. L/R alignment, NaN guard), DSP (HPF, gate, compressor, auto-level balance, ducking, limiter), v1.3.1 hardening
 ```
 (One test builds a default profile, which queries monitor geometry, so it needs an X display; Xvfb works.)
 
@@ -212,12 +212,15 @@ End-to-end audio check (test-only `lavfi` backend, enabled by `LITECAST_TEST_AUD
 - **Windows** (latest): clippy and release build, which compiles the WASAPI and named-pipe code.
 - Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
 - **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
-  `git tag v1.3.0 && git push origin v1.3.0`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
+  `git tag v1.3.1 && git push origin v1.3.1`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
 
 ### Security model
 - Every child process is spawned with an argv list; no shell is ever invoked.
 - Local paths are passed as `file:<path>`, so a filename can't be read as an ffmpeg protocol (`concat:`, `subfile,`, etc.).
 - Profiles are size-capped (4 MiB), clamped and repaired by `sanitize()`. Encoder, format and backend names are whitelisted. A broken profile is moved aside to `profile.json.bad`.
+- Recordings and screenshots are always written as local files (`file:` protocol), whatever `rec_dir` contains, so a crafted profile cannot upload them to a URL.
+- **Loading a profile** (Profile → Load) that names a different ffmpeg program asks first, because LiteCast runs that file. Decline and the current ffmpeg is kept.
+- A profile that cannot be *read* (locked, permissions) stops the app with an error instead of being renamed to `.bad`; only invalid or oversized profiles are moved aside.
 - The profile is written atomically with mode **0600** in a 0700 directory, because it contains stream keys.
 - Destination URLs are validated: scheme whitelist (`rtmp`, `rtmps`, `srt`), length caps, and rejection of `| [ ] \\ ' " < > ` { } ^` and whitespace. A crafted key cannot inject a second tee output or ffmpeg options.
 - Stream keys of every destination, URL credentials and SRT passphrases/streamids are **redacted** from the log, the UI and status text.
@@ -232,6 +235,7 @@ Scene transitions (cut only), text sources, filters (chroma key, crop, colour co
 ---
 
 ## 7. Changelog
+- **1.3.1**: audit and bug-fix release. Fixes a left/right channel swap that could start after an audio underrun, NaN/inf samples permanently silencing the mix, CPU spikes from denormal floats during silence, and a stop that could hang when the encoder stopped reading audio. Windows `default` devices now follow a change of the default speakers/mic within about 2 s. Recordings and screenshots are always local files. Loading a profile asks before running a different ffmpeg. Stream keys can no longer leak partly at the log line limit. Unreadable profiles are no longer renamed to `.bad`. Negative X11 capture offsets are clamped.
 - **1.3.0**: **audio processing and VU meters**. Mic 80 Hz high-pass, noise gate and soft-knee compressor. **Auto-level** of mic and desktop to one loudness target, so neither is louder or quieter than the other. Optional ducking of desktop under voice. Master −1 dBFS limiter. Live Mic/Desktop/Master meters with peak hold, gain-reduction and auto-gain readouts. **Audio Mixer** dialog (Ctrl+M) with live preview. All backends now use the in-app mixer, so pulse/alsa/dshow no longer lose level to `amix`. New `LITECAST_LOG=1` echoes the log to stderr.
 - **1.2.0**: **native Windows audio**. Mic and system audio (WASAPI loopback) are captured by LiteCast, mixed in-app, and fed to ffmpeg over a secure named pipe. This is on by default and needs no Stereo Mix. Silence is filled when nothing plays. Devices reopen automatically after being unplugged. Record and stream share one capture. Old empty-dshow Windows profiles migrate automatically.
 - **1.1.1**: fix recording and streaming on current ffmpeg builds (e.g. 2026 Windows builds), which failed with *Error parsing options for input file pipe:0*. `-thread_queue_size` is now passed only to ffmpeg 4.x–6.x.

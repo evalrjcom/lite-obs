@@ -1,5 +1,5 @@
 // =============================================================================
-//  litecast_v1.3.0 — LiteCast Studio
+//  litecast_v1.3.1 — LiteCast Studio
 //  A lightweight OBS-style recorder / live streamer in Rust + FLTK.
 //
 //  Architecture (one process, ffmpeg used as an external worker binary):
@@ -25,6 +25,15 @@
 //  Runtime: ffmpeg >= 4.4 on PATH (or set in Settings).
 //
 //  Changelog
+//   1.3.1  Audit fixes: L/R channel swap after an audio underrun; NaN/inf
+//          samples could permanently silence the mix; denormal CPU spikes in
+//          silence; Windows "default" device now follows device switches;
+//          stop could hang if the encoder stopped reading audio; recordings
+//          and screenshots are always local files (no URL upload via
+//          rec_dir); loading a profile asks before running a different
+//          ffmpeg program; partial stream-key leak at the log line limit;
+//          unreadable profiles are no longer renamed to .bad; x11grab
+//          negative offsets. Search "v1.3.1 FIX" in the source.
 //   1.3.0  Audio processing + VU meters for every backend: mic high-pass,
 //          noise gate and soft-knee compressor; auto-level of mic and
 //          desktop to one loudness target (so neither is louder); optional
@@ -177,13 +186,17 @@ struct LogInner {
 impl Logger {
     fn log(&self, msg: impl AsRef<str>) {
         let mut g = lock(&self.inner);
-        let mut line = truncate_chars(msg.as_ref(), 600);
         // Redact stream keys / credentials: ffmpeg echoes the output URL in errors.
+        // v1.3.1 FIX: redact *before* truncating. Truncating first could cut a
+        // key in half at the 600-char limit, and the surviving prefix no
+        // longer matched, so part of the key was logged.
+        let mut line = msg.as_ref().to_string();
         for s in &g.secrets {
             if s.len() >= 4 && line.contains(s.as_str()) {
                 line = line.replace(s.as_str(), "****");
             }
         }
+        let line = truncate_chars(&line, 600);
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -655,8 +668,7 @@ fn ffmpeg_cmd(prog: &str) -> Command {
     c
 }
 
-/// Force the file protocol for local paths so names like "concat:..." or
-/// "subfile,..." cannot be interpreted as ffmpeg protocols.
+/// v1.3.1: doc comment fixed (its first two lines belonged to file_arg).
 /// Unknown/foreign backends fall back to the platform default. On Windows,
 /// a pre-1.2 dshow profile with no devices (which recorded *no audio at
 /// all*) is upgraded to native mic + system audio.
@@ -676,6 +688,15 @@ fn migrate_audio(s: &mut Settings, windows: bool, d: &Settings) {
     }
 }
 
+/// v1.3.1: for files LiteCast *writes* (recordings, screenshots): always the
+/// file protocol, even if the path looks like a URL.
+fn local_file_arg(p: &str) -> String {
+    format!("file:{p}")
+}
+
+/// Inputs: force the file protocol for local paths so names like "concat:..."
+/// or "subfile,..." cannot be read as ffmpeg protocols. "scheme://" inputs
+/// (network media) are passed through on purpose.
 fn file_arg(p: &str) -> String {
     if p.contains("://") {
         p.to_string()
@@ -1174,7 +1195,8 @@ fn capture_args(kind: &SourceKind, w: u32, h: u32, fps: u32) -> Result<Vec<Strin
                 } else {
                     target.clone()
                 };
-                let inp = format!("{disp}+{x},{y}");
+                // v1.3.1 FIX: x11grab rejects "+-10,0"; X11 screen coords are >= 0.
+                let inp = format!("{disp}+{},{}", (*x).max(0), (*y).max(0));
                 p(
                     &mut a,
                     &[
@@ -2089,7 +2111,10 @@ fn encoder_args(
                 _ => p(&["-f", "matroska"]),
             }
             let t = targets.first().map(String::as_str).unwrap_or("");
-            p(&[&file_arg(t)]);
+            // v1.3.1 FIX (security): always a local file. file_arg() lets
+            // "scheme://" through, so a profile with rec_dir = "http://host/"
+            // made ffmpeg upload every recording to that host.
+            p(&[&local_file_arg(t)]);
         }
         OutKind::Stream => {
             // ONE encode fanned out by tee; each slave sits behind a fifo so a
@@ -2295,6 +2320,14 @@ impl Biquad {
         let y = self.b0 * x + self.z1;
         self.z1 = self.b1 * x - self.a1 * y + self.z2;
         self.z2 = self.b2 * x - self.a2 * y;
+        // v1.3.1 FIX: flush denormals. During silence the filter state decays
+        // into subnormal floats, which are up to ~100x slower on x86.
+        if self.z1.abs() < 1e-25 {
+            self.z1 = 0.0;
+        }
+        if self.z2.abs() < 1e-25 {
+            self.z2 = 0.0;
+        }
         y
     }
 }
@@ -2567,7 +2600,17 @@ struct SrcRing {
 
 impl SrcRing {
     fn push(&mut self, s: &[f32]) {
-        self.q.extend(s);
+        // v1.3.1 FIX: a NaN/inf from a device (or a desynced byte stream)
+        // used to enter the biquad/limiter state and silence or corrupt the
+        // mix *permanently*; non-finite samples become 0 and wild values are
+        // bounded (+12 dBFS) before any DSP sees them.
+        self.q.extend(s.iter().map(|&x| {
+            if x.is_finite() {
+                x.clamp(-4.0, 4.0)
+            } else {
+                0.0
+            }
+        }));
         if self.q.len() > RING_MAX {
             let excess = self.q.len() - RING_PRIME;
             self.q.drain(..excess - excess % AUD_CH); // keep L/R alignment
@@ -2582,7 +2625,10 @@ impl SrcRing {
             }
             self.primed = true;
         }
-        let n = out.len().min(self.q.len());
+        // v1.3.1 FIX: on underrun take whole frames only. Draining an odd
+        // sample count left a lone R sample at the front of the ring, which
+        // swapped left/right for the rest of the session.
+        let n = out.len().min(self.q.len() / AUD_CH * AUD_CH);
         for (o, s) in out.iter_mut().zip(self.q.drain(..n)) {
             *o = s;
         }
@@ -2850,15 +2896,21 @@ fn capture_ffmpeg(
     }
     log.log(format!("[audio] {label}: capturing via ffmpeg"));
     let mut buf = vec![0u8; 16 * 1024];
-    let mut carry: Vec<u8> = Vec::with_capacity(4);
+    let mut carry: Vec<u8> = Vec::with_capacity(16 * 1024 + 8);
     let mut samples: Vec<f32> = Vec::with_capacity(4096);
     loop {
         let n = match out.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => n,
+            // v1.3.1 FIX: a signal-interrupted read is not EOF.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
         };
         carry.extend_from_slice(&buf[..n]);
-        let whole = carry.len() / 4 * 4;
+        // v1.3.1 FIX: push whole stereo frames (8 bytes), not whole samples,
+        // so every push keeps the ring L/R-aligned.
+        const FRAME_BYTES: usize = 4 * AUD_CH;
+        let whole = carry.len() / FRAME_BYTES * FRAME_BYTES;
         samples.clear();
         samples.extend(
             carry[..whole]
@@ -2933,6 +2985,12 @@ fn capture_wasapi(
     let name = device
         .get_friendlyname()
         .unwrap_or_else(|_| dev.to_string());
+    // v1.3.1 FIX: WASAPI does not invalidate a stream when the user switches
+    // the Windows default device, so "default" kept capturing the *old*
+    // speakers/mic. Remember the endpoint id and re-check it every 2 s.
+    let follow_default = dev.eq_ignore_ascii_case("default");
+    let dev_id = device.get_id().unwrap_or_default();
+    let mut next_check = Instant::now() + Duration::from_secs(2);
     let mut client = device.get_iaudioclient().map_err(e)?;
     // Shared mode + autoconvert: Windows resamples to 48 kHz stereo f32.
     let fmt = WaveFormat::new(32, 32, SampleType::Float, AUD_RATE, AUD_CH, None);
@@ -2975,8 +3033,18 @@ fn capture_wasapi(
         if let Some(x) = err {
             break Err(x);
         }
-        if bytes.len() >= 4 {
-            let n = bytes.len() / 4 * 4;
+        if follow_default && Instant::now() >= next_check {
+            next_check = Instant::now() + Duration::from_secs(2);
+            if let Ok(id) = en.get_default_device(dir).and_then(|d| d.get_id())
+                && !dev_id.is_empty()
+                && id != dev_id
+            {
+                break Err("default device changed — switching".into());
+            }
+        }
+        // v1.3.1 FIX: whole frames only (see capture_ffmpeg).
+        if bytes.len() >= 4 * AUD_CH {
+            let n = bytes.len() / (4 * AUD_CH) * (4 * AUD_CH);
             samples.clear();
             let (a, b) = bytes.as_slices();
             let mut it = a.iter().chain(b.iter()).take(n).copied();
@@ -3599,6 +3667,19 @@ impl OutputSession {
                         && let Some(n) = &self.audio_pipe
                     {
                         AudioPipe::poke(n);
+                    }
+                    // v1.3.1 FIX: the Windows pipe write has no timeout; if the
+                    // encoder stopped reading audio, the writer blocked forever
+                    // and join() hung this thread (encoder never reaped).
+                    // Killing the encoder breaks the pipe and frees it.
+                    let t = Instant::now();
+                    while !a.is_finished() && t.elapsed() < Duration::from_secs(2) {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    if !a.is_finished()
+                        && let Some(c) = lock(&self.child).as_mut()
+                    {
+                        let _ = c.kill();
                     }
                     let _ = a.join();
                 }
@@ -5710,8 +5791,6 @@ impl AppState {
     }
 
     // --- outputs -------------------------------------------------------------
-    /// Native audio hub for a new output: reuse the running one when the
-    /// audio settings are unchanged (record + stream share one capture).
     /// Bring the audio engine in line with the settings: restart capture
     /// only if the sources changed; DSP parameters apply live.
     fn ensure_audio(&mut self) {
@@ -5740,6 +5819,8 @@ impl AppState {
         }
     }
 
+    /// Audio hub for a new output: reuses the running one when the audio
+    /// settings are unchanged (record + stream share one capture).
     fn audio_hub(&mut self) -> Option<Arc<AudioHub>> {
         self.ensure_audio();
         self.audio_hub.clone()
@@ -5835,7 +5916,7 @@ impl AppState {
             "pipe:0".into(),
             "-frames:v".into(),
             "1".into(),
-            file_arg(&path.to_string_lossy()),
+            local_file_arg(&path.to_string_lossy()), // v1.3.1 FIX: never a URL
         ];
         let (ff, log) = (s.ffmpeg_path.clone(), self.log.clone());
         let h = thread::spawn(move || {
@@ -6517,6 +6598,30 @@ impl AppState {
                         if self.dirty {
                             self.save();
                         }
+                        let mut p = p;
+                        // v1.3.1 FIX (security): ffmpeg_path is an executable
+                        // LiteCast runs. Loading a profile from someone else must
+                        // not silently run an arbitrary program: ask first, and
+                        // keep the current ffmpeg if the user declines.
+                        if p.settings.ffmpeg_path != self.prof.settings.ffmpeg_path {
+                            let q = format!(
+                                "This profile sets the ffmpeg program to:\n\n{}\n\n\
+                                 LiteCast will run this file. Only allow it if you trust \
+                                 where the profile came from.",
+                                truncate_chars(&p.settings.ffmpeg_path, 300)
+                            );
+                            if dialog::choice2_default(
+                                &label_escape(&q),
+                                "Keep current ffmpeg",
+                                "Allow",
+                                "",
+                            ) != Some(1)
+                            {
+                                p.settings.ffmpeg_path = self.prof.settings.ffmpeg_path.clone();
+                                self.log
+                                    .log("profile ffmpeg path not trusted; kept the current one");
+                            }
+                        }
                         self.stop_pipeline();
                         let ff_changed = p.settings.ffmpeg_path != self.prof.settings.ffmpeg_path;
                         self.prof = p;
@@ -6736,9 +6841,18 @@ fn main() {
             Ok(p) => p,
             Err(e) => {
                 log.log(format!("profile load failed ({e}); using defaults"));
-                let bak = profile_path.with_extension("json.bad");
-                let _ = fs::rename(&profile_path, &bak);
-                log.log(format!("bad profile moved to {}", bak.display()));
+                // v1.3.1 FIX: move the file aside only if its *content* is bad.
+                // A transient read error (locked file, permissions, network
+                // drive) used to rename a perfectly good profile to .bad, and
+                // the next autosave then replaced it with defaults.
+                if e.starts_with("invalid profile") || e.starts_with("profile too large") {
+                    let bak = profile_path.with_extension("json.bad");
+                    let _ = fs::rename(&profile_path, &bak);
+                    log.log(format!("bad profile moved to {}", bak.display()));
+                } else {
+                    eprintln!("cannot read profile {}: {e}", profile_path.display());
+                    std::process::exit(1);
+                }
                 Profile::default()
             }
         }
@@ -7118,6 +7232,71 @@ mod tests {
         assert_eq!(pcm_bytes(&[1.0, -0.5]), [0, 0, 128, 63, 0, 0, 0, 191]);
         assert_ne!(rand_hex(), rand_hex());
         assert_eq!(rand_hex().len(), 32);
+
+        // v1.3.1: an odd-length ring on underrun must not swap L/R afterwards.
+        let mut r = SrcRing::default();
+        let lr: Vec<f32> = (0..RING_PRIME)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        r.push(&lr);
+        r.push(&[1.0]); // a lone L sample (partial frame)
+        while r.q.len() >= AUD_CHUNK {
+            r.take(&mut out);
+        }
+        r.take(&mut out); // underrun: whole frames only, lone L stays queued
+        assert_eq!(r.q.len(), 1);
+        r.push(&[-1.0]); // its R arrives
+        r.push(&lr);
+        r.take(&mut out);
+        assert!(
+            out.as_chunks::<2>()
+                .0
+                .iter()
+                .all(|f| f[0] == 1.0 && f[1] == -1.0)
+        );
+        // v1.3.1: non-finite / absurd samples are neutralised on entry.
+        let mut r = SrcRing::default();
+        r.push(&[f32::NAN, f32::INFINITY, -1e9, 0.25]);
+        assert_eq!(
+            r.q.iter().copied().collect::<Vec<_>>(),
+            [0.0, 0.0, -4.0, 0.25]
+        );
+    }
+
+    #[test]
+    fn v131_hardening() {
+        // Recordings/screenshots are always local files, even with a URL dir.
+        let s = Settings {
+            audio_api: "none".into(),
+            ..Settings::default()
+        };
+        let ff = FfInfo {
+            ok: true,
+            major: 7,
+            ..FfInfo::default()
+        };
+        let a = encoder_args(
+            &s,
+            &ff,
+            OutKind::Record,
+            &["http://evil/x.mkv".into()],
+            None,
+        );
+        assert_eq!(a.last().map(String::as_str), Some("file:http://evil/x.mkv"));
+        assert_eq!(file_arg("https://cdn/a.mp4"), "https://cdn/a.mp4"); // inputs unchanged
+        // Secrets are redacted even when the line is longer than the log cap.
+        let log = Logger::default();
+        log.set_secrets(vec!["sk_live_SECRETKEY123".into()]);
+        log.log(format!("{}sk_live_SECRETKEY123", "x".repeat(590)));
+        let (_, lines) = log.since(0);
+        assert!(!lines[0].contains("sk_live") && !lines[0].contains("SECRET"));
+        // Denormals are flushed out of the filter state during silence.
+        let mut bq = Biquad::highpass(80.0);
+        bq.run(1.0);
+        for _ in 0..200_000 {
+            bq.run(0.0);
+        }
+        assert_eq!((bq.z1, bq.z2), (0.0, 0.0));
     }
 
     #[test]
