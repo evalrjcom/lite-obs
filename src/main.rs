@@ -1,5 +1,5 @@
 // =============================================================================
-//  litecast_v1.3.1 — LiteCast Studio
+//  litecast_v1.3.2 — LiteCast Studio
 //  A lightweight OBS-style recorder / live streamer in Rust + FLTK.
 //
 //  Architecture (one process, ffmpeg used as an external worker binary):
@@ -25,6 +25,14 @@
 //  Runtime: ffmpeg >= 4.4 on PATH (or set in Settings).
 //
 //  Changelog
+//   1.3.2  Efficiency: empty scenes skip compositing (re-publish one black
+//          frame); previews are built only after the UI drew the last one
+//          (~half the preview work at 60 fps, none while minimised); tall
+//          previews repeat rows by memcpy; audio mixer sleeps to the next
+//          block (300 -> 100 wakeups/s); PCM chunks are recycled instead of
+//          allocated per block. Dropped audio (encoder > 1 s behind) is now
+//          logged and shown in the status bar. Log times are local time.
+//          Search "v1.3.2" in the source.
 //   1.3.1  Audit fixes: L/R channel swap after an audio underrun; NaN/inf
 //          samples could permanently silence the mix; denormal CPU spikes in
 //          silence; Windows "default" device now follows device switches;
@@ -170,6 +178,35 @@ fn even(v: u32) -> u32 {
     v & !1
 }
 
+/// v1.3.2: current local time of day (h, m, s), for log stamps.
+#[cfg(unix)]
+fn local_hms() -> (u32, u32, u32) {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let t = secs as libc::time_t;
+    // SAFETY: localtime_r is the thread-safe variant; both pointers are valid
+    // for the call and `tm` is plain data (all-zero is a valid value).
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+        return (
+            (secs / 3600 % 24) as u32,
+            (secs / 60 % 60) as u32,
+            (secs % 60) as u32,
+        );
+    }
+    (tm.tm_hour as u32, tm.tm_min as u32, tm.tm_sec as u32)
+}
+
+#[cfg(windows)]
+fn local_hms() -> (u32, u32, u32) {
+    // SAFETY: GetLocalTime only writes the SYSTEMTIME we pass.
+    let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&mut st) };
+    (st.wHour as u32, st.wMinute as u32, st.wSecond as u32)
+}
+
 // ----------------------------------------------------------------------------
 // Logger (thread-safe ring buffer with secret redaction)
 // ----------------------------------------------------------------------------
@@ -197,17 +234,10 @@ impl Logger {
             }
         }
         let line = truncate_chars(&line, 600);
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let line = format!(
-            "{:02}:{:02}:{:02} {}",
-            (secs / 3600) % 24,
-            (secs / 60) % 60,
-            secs % 60,
-            line
-        );
+        // v1.3.2: local wall-clock time (was UTC with no marker, which read
+        // as the wrong time of day everywhere outside UTC).
+        let (h, m, sec) = local_hms();
+        let line = format!("{h:02}:{m:02}:{sec:02} {line}");
         // Echo to stderr in debug builds, or when LITECAST_LOG=1 (CI / headless runs).
         if cfg!(debug_assertions) || std::env::var_os("LITECAST_LOG").is_some() {
             eprintln!("{line}");
@@ -1544,6 +1574,8 @@ struct PreviewShared {
     buf: Mutex<(Vec<u8>, usize, usize)>, // RGB8, w, h
     seq: AtomicU64,
     req: AtomicU64, // (w << 32) | h requested by the UI
+    /// v1.3.2: last `seq` the UI actually drew (compositor back-pressure).
+    drawn: AtomicU64,
 }
 
 struct CompShared {
@@ -1652,7 +1684,9 @@ fn blit(dst: &mut [u8], cw: usize, ch: usize, src: &[u8], l: &Layer, opaque: boo
 fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
     let (cw, ch) = (sh.cw as usize, sh.ch as usize);
     let flen = cw * ch * 4;
-    let black = [0u8, 0, 0, 255].repeat(cw * ch);
+    // v1.3.2: the black frame is a shared Arc, so an empty scene can publish
+    // it as-is instead of copying 8 MB into a fresh canvas every tick.
+    let black: Arc<Vec<u8>> = Arc::new([0u8, 0, 0, 255].repeat(cw * ch));
     let mut pool: Vec<Arc<Vec<u8>>> = Vec::new();
     let period_ns = 1_000_000_000u64 / sh.fps.max(1) as u64;
     let mut t0 = Instant::now();
@@ -1660,53 +1694,82 @@ fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
     let (mut fps_t, mut fps_n) = (Instant::now(), 0u64);
     let mut xmap: Vec<usize> = Vec::new();
     let mut pbuf: Vec<u8> = Vec::new();
+    // v1.3.2: (w, h, was_empty) of the last preview built.
+    let mut last_pv: (usize, usize, bool) = (0, 0, false);
     while !sh.stop.load(Relaxed) {
         let ts = Instant::now();
-        // Recycle a canvas buffer nobody else references (encoders release theirs after write).
-        let mut arc = match pool.iter().position(|a| Arc::strong_count(a) == 1) {
-            Some(i) => pool.swap_remove(i),
-            None => Arc::new(vec![0u8; flen]),
-        };
-        if Arc::get_mut(&mut arc).is_none() {
-            arc = Arc::new(vec![0u8; flen]);
-        }
-        let buf = Arc::get_mut(&mut arc).expect("unique canvas buffer");
         let layers = lock(&sh.layers).clone();
         // Hold each slot lock only for an Arc clone.
         let frames: Vec<Option<Arc<Vec<u8>>>> =
             layers.iter().map(|l| lock(&l.slot).clone()).collect();
-        // Skip the 8 MB clear when the bottom layer is opaque and covers the canvas.
-        let covered = match (layers.first(), frames.first()) {
-            (Some(l), Some(Some(_))) => {
-                l.opacity == 255
-                    && l.opaque.load(Relaxed)
-                    && l.x <= 0
-                    && l.y <= 0
-                    && l.x as i64 + l.w as i64 >= cw as i64
-                    && l.y as i64 + l.h as i64 >= ch as i64
+        // v1.3.2: nothing to draw (no visible sources, or none has produced a
+        // frame yet): skip compositing entirely and re-publish the black frame.
+        let empty = frames.iter().all(Option::is_none);
+        let frame: Arc<Vec<u8>> = if empty {
+            black.clone()
+        } else {
+            // Recycle a canvas buffer nobody else references (encoders release theirs after write).
+            let mut arc = match pool.iter().position(|a| Arc::strong_count(a) == 1) {
+                Some(i) => pool.swap_remove(i),
+                None => Arc::new(vec![0u8; flen]),
+            };
+            if Arc::get_mut(&mut arc).is_none() {
+                arc = Arc::new(vec![0u8; flen]);
             }
-            _ => false,
+            let buf = Arc::get_mut(&mut arc).expect("unique canvas buffer");
+            // Skip the 8 MB clear when the bottom layer is opaque and covers the canvas.
+            let covered = match (layers.first(), frames.first()) {
+                (Some(l), Some(Some(_))) => {
+                    l.opacity == 255
+                        && l.opaque.load(Relaxed)
+                        && l.x <= 0
+                        && l.y <= 0
+                        && l.x as i64 + l.w as i64 >= cw as i64
+                        && l.y as i64 + l.h as i64 >= ch as i64
+                }
+                _ => false,
+            };
+            if !covered {
+                buf.copy_from_slice(&black);
+            }
+            for (l, f) in layers.iter().zip(frames.iter()) {
+                if let Some(f) = f {
+                    blit(buf, cw, ch, f, l, l.opaque.load(Relaxed));
+                }
+            }
+            if pool.len() < 6 {
+                pool.push(arc.clone());
+            }
+            arc
         };
-        if !covered {
-            buf.copy_from_slice(&black);
-        }
-        for (l, f) in layers.iter().zip(frames.iter()) {
-            if let Some(f) = f {
-                blit(buf, cw, ch, f, l, l.opaque.load(Relaxed));
-            }
-        }
         // Nearest-neighbour downscale into RGB preview, outside the shared lock.
         let req = pv.req.load(Relaxed);
         let (pw, ph) = ((req >> 32) as usize, (req & 0xffff_ffff) as usize);
-        if pw > 0 && ph > 0 && pw <= 8192 && ph <= 8192 {
+        // v1.3.2: build a preview only once the UI has drawn the previous one
+        // (at 60 fps the UI shows ~30, so half the builds were thrown away,
+        // and all of them while the window is minimised), and never rebuild
+        // an unchanged black preview.
+        let ui_ready = pv.drawn.load(Relaxed) >= pv.seq.load(Relaxed);
+        let same_black = empty && last_pv == (pw, ph, true);
+        if pw > 0 && ph > 0 && pw <= 8192 && ph <= 8192 && ui_ready && !same_black {
             if xmap.len() != pw {
                 xmap = (0..pw).map(|x| (x * cw / pw).min(cw - 1) * 4).collect();
             }
             pbuf.resize(pw * ph * 3, 0);
+            let src = &frame[..];
+            let mut prev_sy = usize::MAX;
             for y in 0..ph {
                 let sy = (y * ch / ph).min(ch - 1);
-                let row = &buf[sy * cw * 4..(sy + 1) * cw * 4];
-                let out = &mut pbuf[y * pw * 3..(y + 1) * pw * 3];
+                let row_bytes = pw * 3;
+                if sy == prev_sy {
+                    // v1.3.2: preview taller than the canvas: repeat the row
+                    // with one memcpy instead of re-gathering every pixel.
+                    pbuf.copy_within((y - 1) * row_bytes..y * row_bytes, y * row_bytes);
+                    continue;
+                }
+                prev_sy = sy;
+                let row = &src[sy * cw * 4..(sy + 1) * cw * 4];
+                let out = &mut pbuf[y * row_bytes..(y + 1) * row_bytes];
                 for (o, &si) in out.as_chunks_mut::<3>().0.iter_mut().zip(xmap.iter()) {
                     o[0] = row[si + 2];
                     o[1] = row[si + 1];
@@ -1720,11 +1783,9 @@ fn comp_loop(sh: Arc<CompShared>, pv: Arc<PreviewShared>) {
                 g.2 = ph;
             }
             pv.seq.fetch_add(1, Relaxed);
+            last_pv = (pw, ph, empty);
         }
-        if pool.len() < 6 {
-            pool.push(arc.clone());
-        }
-        *lock(&sh.canvas) = Some(arc);
+        *lock(&sh.canvas) = Some(frame);
         sh.compose_us
             .store(ts.elapsed().as_micros() as u64, Relaxed);
 
@@ -2648,7 +2709,55 @@ fn pcm_bytes(s: &[f32]) -> Vec<u8> {
 }
 
 type AudioChunk = Arc<Vec<u8>>;
-type Subs = Arc<Mutex<Vec<std::sync::mpsc::SyncSender<AudioChunk>>>>;
+
+/// v1.3.2: one output's audio feed, with a count of blocks it lost because
+/// its encoder fell more than ~1 s behind (each lost block = 10 ms of drift).
+struct Sub {
+    tag: String,
+    tx: std::sync::mpsc::SyncSender<AudioChunk>,
+    drops: Arc<AtomicU64>,
+    logged: u64,
+    last_log: Option<Instant>,
+}
+type Subs = Arc<Mutex<Vec<Sub>>>;
+
+/// v1.3.2: recycles the 10 ms PCM chunks instead of allocating ~100 per
+/// second. Chunks go out in FIFO order, so the oldest one is the first to be
+/// released by every encoder; it is reused once only the pool holds it.
+#[derive(Default)]
+struct ChunkPool {
+    q: VecDeque<AudioChunk>,
+    allocs: u64,
+}
+
+impl ChunkPool {
+    /// 4 s of chunks: more than any subscriber can hold (1 s channel each).
+    const CAP: usize = 400;
+    fn get(&mut self, s: &[f32]) -> AudioChunk {
+        let mut a = match self.q.front() {
+            Some(f) if Arc::strong_count(f) == 1 => self.q.pop_front().expect("front exists"),
+            _ => {
+                self.allocs += 1;
+                Arc::new(Vec::with_capacity(s.len() * 4))
+            }
+        };
+        if let Some(v) = Arc::get_mut(&mut a) {
+            v.clear();
+            for x in s {
+                v.extend_from_slice(&x.to_le_bytes());
+            }
+        } else {
+            // Not reachable (count was 1), but never hand out stale audio.
+            self.allocs += 1;
+            a = Arc::new(pcm_bytes(s));
+        }
+        self.q.push_back(a.clone());
+        if self.q.len() > Self::CAP {
+            self.q.pop_front();
+        }
+        a
+    }
+}
 
 /// One configured capture source.
 #[derive(Clone, Debug, PartialEq)]
@@ -2696,10 +2805,10 @@ impl AudioHub {
                 threads.push(h);
             }
         }
-        let (stop2, subs2) = (stop.clone(), subs.clone());
+        let (stop2, subs2, log2) = (stop.clone(), subs.clone(), log.clone());
         if let Ok(h) = thread::Builder::new()
             .name("audio-mixer".into())
-            .spawn(move || mixer_loop(rings, chans, dsp, meters, subs2, stop2))
+            .spawn(move || mixer_loop(rings, chans, dsp, meters, subs2, stop2, log2))
         {
             threads.push(h);
         }
@@ -2714,10 +2823,18 @@ impl AudioHub {
 
     /// ~1 s of buffering per subscriber; a stalled encoder loses chunks
     /// instead of stalling the mixer (or the other outputs).
-    fn subscribe(&self) -> std::sync::mpsc::Receiver<AudioChunk> {
+    /// v1.3.2: also returns the subscriber's dropped-block counter.
+    fn subscribe(&self, tag: &str) -> (std::sync::mpsc::Receiver<AudioChunk>, Arc<AtomicU64>) {
         let (tx, rx) = std::sync::mpsc::sync_channel(100);
-        lock(&self.subs).push(tx);
-        rx
+        let drops = Arc::new(AtomicU64::new(0));
+        lock(&self.subs).push(Sub {
+            tag: tag.to_string(),
+            tx,
+            drops: drops.clone(),
+            logged: 0,
+            last_log: None,
+        });
+        (rx, drops)
     }
 }
 
@@ -2744,8 +2861,10 @@ fn mixer_loop(
     meters: Arc<Mutex<Meters>>,
     subs: Subs,
     stop: Arc<AtomicBool>,
+    log: Logger,
 ) {
     let t0 = Instant::now();
+    let mut pool = ChunkPool::default();
     let mut blocks: u64 = 0;
     let mut states: Vec<SrcDsp> = chans.iter().map(|c| SrcDsp::new(c.1)).collect();
     let mut tmp = vec![0f32; AUD_CHUNK];
@@ -2755,7 +2874,13 @@ fn mixer_loop(
     while !stop.load(Relaxed) {
         let due = t0.elapsed().as_millis() as u64 / 10;
         if blocks >= due {
-            thread::sleep(Duration::from_millis(3));
+            // v1.3.2: sleep until the next block is due (one wakeup per 10 ms
+            // block) instead of polling every 3 ms (~300 wakeups/s).
+            let next = t0 + Duration::from_millis((blocks + 1) * 10);
+            let now = Instant::now();
+            if next > now {
+                thread::sleep(next - now);
+            }
             continue;
         }
         // > 1 s behind (machine suspended?): skip ahead rather than burst.
@@ -2789,12 +2914,30 @@ fn mixer_loop(
             }
             lim.run(&mut mix, p.limiter);
             meter_update(&mut m_rms, &mut m_peak, &mut m_hold, &mut m_hold_n, &mix);
-            let c: AudioChunk = Arc::new(pcm_bytes(&mix));
-            lock(&subs).retain(|tx| {
-                !matches!(
-                    tx.try_send(c.clone()),
-                    Err(std::sync::mpsc::TrySendError::Disconnected(_))
-                )
+            let c: AudioChunk = pool.get(&mix); // v1.3.2: recycled buffer
+            lock(&subs).retain_mut(|sub| match sub.tx.try_send(c.clone()) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    // v1.3.2: was silent. A full queue means this encoder is
+                    // > 1 s behind; the lost 10 ms shifts its audio earlier.
+                    let n = sub.drops.fetch_add(1, Relaxed) + 1;
+                    if sub
+                        .last_log
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(10))
+                    {
+                        log.log(format!(
+                            "[audio] {}: encoder is not keeping up, {} ms of audio dropped \
+                             (+{} ms) — audio may drift; try a faster preset or lower resolution",
+                            sub.tag,
+                            n * 10,
+                            (n - sub.logged) * 10
+                        ));
+                        sub.logged = n;
+                        sub.last_log = Some(Instant::now());
+                    }
+                    true
+                }
             });
             blocks += 1;
         }
@@ -3509,6 +3652,8 @@ struct OutputSession {
     audio_writer: Option<JoinHandle<()>>,
     audio_pipe: Option<String>,
     _hub: Option<Arc<AudioHub>>,
+    /// v1.3.2: audio blocks this output lost (10 ms each).
+    audio_drops: Option<Arc<AtomicU64>>,
 }
 
 impl OutputSession {
@@ -3582,6 +3727,7 @@ impl OutputSession {
             audio_writer: None,
             audio_pipe: pipe_name,
             _hub: hub.clone(),
+            audio_drops: None,
         };
         let (stop, dead, frames, comp2, log2) = (
             sess.stop.clone(),
@@ -3598,7 +3744,8 @@ impl OutputSession {
                 .map_err(|e| e.to_string())?,
         );
         if let (Some(p), Some(h)) = (pipe, &hub) {
-            let (rx, stop) = (h.subscribe(), sess.stop.clone());
+            let ((rx, drops), stop) = (h.subscribe(tag), sess.stop.clone());
+            sess.audio_drops = Some(drops);
             sess.audio_writer = thread::Builder::new()
                 .name(format!("audio-{tag}"))
                 .spawn(move || p.serve(rx, stop))
@@ -3620,6 +3767,14 @@ impl OutputSession {
             })
             .collect::<Vec<_>>()
             .join(", ")
+    }
+
+    /// v1.3.2: status-bar suffix when this output has lost audio.
+    fn drop_note(&self) -> String {
+        match self.audio_drops.as_ref().map(|d| d.load(Relaxed)) {
+            Some(n) if n > 0 => format!(" ⚠ audio −{} ms", n * 10),
+            _ => String::new(),
+        }
     }
 
     fn alive(&self) -> bool {
@@ -4032,6 +4187,8 @@ fn build_ui(
             }
             {
                 let g = lock(&pv.buf);
+                // v1.3.2: tell the compositor this frame reached the screen.
+                pv.drawn.store(pv.seq.load(Relaxed), Relaxed);
                 if g.1 > 0 && g.2 > 0 && g.0.len() >= g.1 * g.2 * 3 {
                     if let Ok(mut img) = RgbImage::new(
                         &g.0[..g.1 * g.2 * 3],
@@ -6130,13 +6287,18 @@ impl AppState {
         // Status bar.
         let mut parts: Vec<String> = vec![];
         if let Some(r) = &self.rec {
-            parts.push(format!("● REC {}", fmt_dur(r.started.elapsed())));
+            parts.push(format!(
+                "● REC {}{}",
+                fmt_dur(r.started.elapsed()),
+                r.drop_note()
+            ));
         }
         if let Some(r) = &self.stream {
             parts.push(format!(
-                "● LIVE {} → {}",
+                "● LIVE {} → {}{}",
                 fmt_dur(r.started.elapsed()),
-                r.health_summary()
+                r.health_summary(),
+                r.drop_note()
             ));
         } else if let Some((at, n)) = self.stream_retry {
             parts.push(format!(
@@ -6866,6 +7028,7 @@ fn main() {
         buf: Mutex::new((vec![], 0, 0)),
         seq: AtomicU64::new(0),
         req: AtomicU64::new(0),
+        drawn: AtomicU64::new(0),
     });
     let ov = Arc::new(Mutex::new(Overlay::default()));
     let meters: Arc<Mutex<Meters>> = Arc::default();
@@ -6915,7 +7078,9 @@ fn main() {
     st.refresh_sources();
     st.update_buttons();
 
-    // Preview repaint at ~30 Hz, only when a new frame arrived.
+    // Preview repaint at ~30 Hz, only when a new frame arrived. v1.3.2: the
+    // compositor now waits for each draw before building the next preview,
+    // so at 60 fps it builds ~30 previews/s instead of 60.
     {
         let mut preview = st.ui.preview.clone();
         let pv = pv.clone();
@@ -7261,6 +7426,48 @@ mod tests {
             r.q.iter().copied().collect::<Vec<_>>(),
             [0.0, 0.0, -4.0, 0.25]
         );
+    }
+
+    #[test]
+    fn v132_efficiency() {
+        // Chunk pool: steady state reuses buffers (no per-block allocation)
+        // and never hands out a chunk an encoder still holds.
+        let mut pool = ChunkPool::default();
+        let held = pool.get(&[1.0, 2.0]); // like a lagging subscriber
+        for i in 0..1000 {
+            let c = pool.get(&[i as f32, -(i as f32)]);
+            assert_eq!(&c[..], &pcm_bytes(&[i as f32, -(i as f32)])[..]);
+        }
+        assert_eq!(&held[..], &pcm_bytes(&[1.0, 2.0])[..]); // untouched
+        assert!(
+            pool.allocs <= ChunkPool::CAP as u64 + 2,
+            "allocs {}",
+            pool.allocs
+        );
+        assert!(pool.q.len() <= ChunkPool::CAP);
+        // Encoders that keep up: one buffer is reused for ever.
+        let mut pool = ChunkPool::default();
+        for i in 0..1000 {
+            drop(pool.get(&[i as f32, 0.0]));
+        }
+        assert_eq!(pool.allocs, 1);
+        // A subscriber that stops reading is counted and logged, not silent.
+        let log = Logger::default();
+        let hub = AudioHub::start("t".into(), vec![], Arc::default(), Arc::default(), &log);
+        let (_rx, drops) = hub.subscribe("rec");
+        thread::sleep(Duration::from_millis(1500)); // 100-block queue fills in 1 s
+        let n = drops.load(Relaxed);
+        assert!((20..=60).contains(&n), "dropped blocks {n}");
+        let (_, lines) = log.since(0);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("rec: encoder is not keeping up"))
+        );
+        drop(hub);
+        // Local-time stamps are a valid time of day.
+        let (h, m, s) = local_hms();
+        assert!(h < 24 && m < 60 && s < 61);
     }
 
     #[test]

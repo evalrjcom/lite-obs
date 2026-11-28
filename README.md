@@ -1,8 +1,8 @@
-# LiteCast Studio v1.3.1 — User & Developer Guide
+# LiteCast Studio v1.3.2 — User & Developer Guide
 
 [![CI](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml/badge.svg)](https://github.com/evalrjcom/litecast/actions/workflows/ci.yml)
 
-`litecast_v1.3.1` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only. It drives **ffmpeg** as an external worker for capture and encoding.
+`litecast_v1.3.2` is a lightweight, OBS-style screen recorder and live streamer written in Rust with an FLTK interface. It ships as one source file (`src/main.rs`) with three crate dependencies (`fltk`, `serde`, `serde_json`), plus `wasapi` and `windows-sys` on Windows only and `libc` on Linux/macOS (local-time log stamps). It drives **ffmpeg** as an external worker for capture and encoding.
 
 ---
 
@@ -165,6 +165,7 @@ The mic always passes through an 80 Hz high-pass (desk thumps, rumble). Turn aut
 | Mic and desktop at very different levels | Ctrl+M: make sure *Auto-level* is on for both. Lower *Target* if the Master meter shows constant limiter GR |
 | Background hiss pumps between words | Lower the gate threshold (e.g. −55 dB) or raise it above the hiss level shown on the Mic meter while you are silent |
 | No audio in recordings (Windows) | Settings → Audio backend `wasapi`, with Mic and Desktop set to `default` (or a device from **Detect devices**). The log shows `[audio] mic: capturing "…"` when it works |
+| Status bar shows `⚠ audio −N ms` / log says *encoder is not keeping up* | The encoder fell more than 1 s behind, so audio was dropped and may drift. Use a faster x264 preset or a hardware encoder, or lower the canvas size/FPS |
 | Recording stops instantly with *Error parsing options for input file pipe:0* | Your ffmpeg is newer than LiteCast ≤ 1.1.0 expected. Update to 1.1.1 or later |
 | Stream keeps reconnecting / ⟳ next to a destination | Check that destination's URL and key; the log shows the redacted ffmpeg error. Rumble keys are per-event, so generate a new one or enable a static key |
 | "ffmpeg lacks RTMPS" on Go Live | Your ffmpeg was built without TLS. Install a full build (distro ffmpeg, gyan.dev or BtbN). Kick needs RTMPS |
@@ -200,7 +201,7 @@ Audio:  mic (WASAPI / ffmpeg helper) ─▶ ring ─▶ HPF ─▶ gate ─▶ c
 
 ### Tests
 ```bash
-DISPLAY=:0 cargo test --release   # 14 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio transport (incl. L/R alignment, NaN guard), DSP (HPF, gate, compressor, auto-level balance, ducking, limiter), v1.3.1 hardening
+DISPLAY=:0 cargo test --release   # 15 unit tests: blending, clipping, sanitising, args, redaction, destinations, migration, pre-flight, audio transport (incl. L/R alignment, NaN guard), DSP (HPF, gate, compressor, auto-level balance, ducking, limiter), v1.3.1 hardening, v1.3.2 efficiency (chunk reuse, drop reporting)
 ```
 (One test builds a default profile, which queries monitor geometry, so it needs an X display; Xvfb works.)
 
@@ -212,7 +213,7 @@ End-to-end audio check (test-only `lavfi` backend, enabled by `LITECAST_TEST_AUD
 - **Windows** (latest): clippy and release build, which compiles the WASAPI and named-pipe code.
 - Artifacts are `litecast_v<ver>-linux-x86_64.tar.gz` and `litecast_v<ver>-windows-x86_64.zip`, each with a SHA-256 file. Download them from the run page.
 - **Release**: bump `version` in `Cargo.toml` and the version in this README's title, commit, then
-  `git tag v1.3.1 && git push origin v1.3.1`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
+  `git tag v1.3.2 && git push origin v1.3.2`. The tag must match `Cargo.toml`, otherwise CI fails, and the binaries are attached to a GitHub release automatically.
 
 ### Security model
 - Every child process is spawned with an argv list; no shell is ever invoked.
@@ -235,6 +236,7 @@ Scene transitions (cut only), text sources, filters (chroma key, crop, colour co
 ---
 
 ## 7. Changelog
+- **1.3.2**: efficiency release. An empty scene no longer composites every frame: about 33% → 14% of a core at 1080p60. Previews are built only after the window drew the previous one, which roughly halves preview work at 60 fps and stops it while the window is minimised. The audio mixer wakes once per 10 ms block instead of every 3 ms, and audio buffers are reused instead of allocated about 100 times a second. If an encoder falls behind and audio is dropped, the log says so and the status bar shows `⚠ audio −N ms`. Log times are now your local time.
 - **1.3.1**: audit and bug-fix release. Fixes a left/right channel swap that could start after an audio underrun, NaN/inf samples permanently silencing the mix, CPU spikes from denormal floats during silence, and a stop that could hang when the encoder stopped reading audio. Windows `default` devices now follow a change of the default speakers/mic within about 2 s. Recordings and screenshots are always local files. Loading a profile asks before running a different ffmpeg. Stream keys can no longer leak partly at the log line limit. Unreadable profiles are no longer renamed to `.bad`. Negative X11 capture offsets are clamped.
 - **1.3.0**: **audio processing and VU meters**. Mic 80 Hz high-pass, noise gate and soft-knee compressor. **Auto-level** of mic and desktop to one loudness target, so neither is louder or quieter than the other. Optional ducking of desktop under voice. Master −1 dBFS limiter. Live Mic/Desktop/Master meters with peak hold, gain-reduction and auto-gain readouts. **Audio Mixer** dialog (Ctrl+M) with live preview. All backends now use the in-app mixer, so pulse/alsa/dshow no longer lose level to `amix`. New `LITECAST_LOG=1` echoes the log to stderr.
 - **1.2.0**: **native Windows audio**. Mic and system audio (WASAPI loopback) are captured by LiteCast, mixed in-app, and fed to ffmpeg over a secure named pipe. This is on by default and needs no Stereo Mix. Silence is filled when nothing plays. Devices reopen automatically after being unplugged. Record and stream share one capture. Old empty-dshow Windows profiles migrate automatically.
